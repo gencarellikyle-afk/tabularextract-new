@@ -2,45 +2,76 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>TabularExtract - Perfect PDF Tables</title>
+  <title>TabularExtract - Perfect Tables</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-zinc-950 text-white min-h-screen">
-  <div class="max-w-3xl mx-auto p-8">
-    <h1 class="text-6xl font-bold mb-4 text-center">TabularExtract</h1>
-    <p class="text-xl text-zinc-400 text-center mb-12">The highest-quality PDF table extractor on earth.<br>Untouchable quality. Works on any PDF.</p>
-    
-    <div class="bg-zinc-900 rounded-3xl p-10">
-      <form id="uploadForm" class="space-y-6">
-        <div class="border-2 border-dashed border-zinc-700 rounded-2xl p-12 text-center">
-          <input type="file" id="pdf" accept="application/pdf" class="hidden">
-          <button type="button" onclick="document.getElementById('pdf').click()" 
-                  class="bg-white text-black px-10 py-4 rounded-full font-semibold text-lg hover:bg-zinc-200">
-            Choose PDF
-          </button>
-          <p class="text-zinc-400 mt-4">or drag & drop your PDF here</p>
-        </div>
-        <button type="button" onclick="uploadFile()" 
-                class="w-full bg-white text-black py-5 rounded-full font-semibold text-xl">
-          Extract All Tables Now
-        </button>
-      </form>
+<body class="bg-zinc-950 text-white">
+  <div class="max-w-4xl mx-auto p-8">
+    <h1 class="text-5xl font-bold text-center mb-8">TabularExtract</h1>
+    <p class="text-xl text-zinc-400 text-center mb-12">Upload any PDF — get perfect tables instantly</p>
+
+    <div id="uploadArea" class="bg-zinc-900 rounded-3xl p-12 text-center">
+      <input type="file" id="pdf" accept="application/pdf" class="hidden">
+      <button onclick="document.getElementById('pdf').click()" 
+              class="bg-white text-black px-12 py-5 rounded-2xl font-semibold text-xl mb-4">
+        Choose PDF
+      </button>
+      <p class="text-zinc-400">or drag & drop</p>
     </div>
-    
-    <p class="text-center text-zinc-500 mt-8 text-sm">No data stored. Instant. Perfect every time.</p>
+
+    <div id="loading" class="hidden text-center mt-8">
+      <div class="animate-spin w-12 h-12 border-4 border-emerald-600 border-t-transparent rounded-full mx-auto"></div>
+      <p class="mt-6 text-lg">Extracting tables...</p>
+    </div>
+
+    <div id="results" class="mt-12"></div>
   </div>
 
   <script>
     async function uploadFile() {
       const file = document.getElementById('pdf').files[0];
       if (!file) return alert("Choose a PDF first");
+
+      document.getElementById('uploadArea').classList.add('hidden');
+      document.getElementById('loading').classList.remove('hidden');
+
       const formData = new FormData();
       formData.append('file', file);
-      const res = await fetch('/upload', { method: 'POST', body: formData });
-      const data = await res.json();
-      console.log("✅ Extraction complete:", data);
-      alert("Tables extracted! Check the console for now. Full download coming soon.");
+
+      try {
+        const res = await fetch('/upload', { method: 'POST', body: formData });
+        const data = await res.json();
+
+        let html = `<h2 class="text-3xl font-bold mb-8">Your Tables (${data.tables.length})</h2>`;
+        
+        data.tables.forEach((table, i) => {
+          const blob = new Blob([table.csv], { type: 'text/csv' });
+          const url = URL.createObjectURL(blob);
+          html += `
+            <div class="bg-zinc-900 rounded-3xl p-8 mb-8">
+              <div class="flex justify-between items-center mb-6">
+                <p class="text-xl">Table ${table.table_id} (Page ${table.page_numbers})</p>
+                <a href="${url}" download="table-${table.table_id}.csv" 
+                   class="bg-emerald-600 hover:bg-emerald-700 px-8 py-3 rounded-2xl font-semibold">
+                  Download CSV
+                </a>
+              </div>
+              <pre class="bg-zinc-950 p-6 rounded-2xl text-sm overflow-auto max-h-96">${table.csv}</pre>
+            </div>`;
+        });
+
+        document.getElementById('results').innerHTML = html;
+      } catch (e) {
+        document.getElementById('results').innerHTML = `<p class="text-red-500 text-center">Error: ${e.message}</p>`;
+      } finally {
+        document.getElementById('loading').classList.add('hidden');
+      }
     }
+
+    // Auto-trigger file input on click
+    document.getElementById('uploadArea').addEventListener('click', () => {
+      document.getElementById('pdf').click();
+    });
   </script>
 </body>
 </html>
