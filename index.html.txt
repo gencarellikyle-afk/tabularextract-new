@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>TabularExtract - Perfect PDF Tables</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-zinc-950 text-white min-h-screen">
+  <div class="max-w-3xl mx-auto p-8">
+    <h1 class="text-6xl font-bold mb-4 text-center">TabularExtract</h1>
+    <p class="text-xl text-zinc-400 text-center mb-12">The highest-quality PDF table extractor on earth.<br>Untouchable quality. Works on any PDF.</p>
+    
+    <div class="bg-zinc-900 rounded-3xl p-10">
+      <form id="uploadForm" class="space-y-6">
+        <div class="border-2 border-dashed border-zinc-700 rounded-2xl p-12 text-center">
+          <input type="file" id="pdf" accept="application/pdf" class="hidden">
+          <button type="button" onclick="document.getElementById('pdf').click()" 
+                  class="bg-white text-black px-10 py-4 rounded-full font-semibold text-lg hover:bg-zinc-200">
+            Choose PDF
+          </button>
+          <p class="text-zinc-400 mt-4">or drag & drop your PDF here</p>
+        </div>
+        <button type="button" onclick="uploadFile()" 
+                class="w-full bg-white text-black py-5 rounded-full font-semibold text-xl">
+          Extract All Tables Now
+        </button>
+      </form>
+    </div>
+    
+    <p class="text-center text-zinc-500 mt-8 text-sm">No data stored. Instant. Perfect every time.</p>
+  </div>
+
+  <script>
+    async function uploadFile() {
+      const file = document.getElementById('pdf').files[0];
+      if (!file) return alert("Choose a PDF first");
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch('/upload', { method: 'POST', body: formData });
+      const data = await res.json();
+      console.log("✅ Extraction complete:", data);
+      alert("Tables extracted! Check the console for now. Full download coming soon.");
+    }
+  </script>
+</body>
+</html>
