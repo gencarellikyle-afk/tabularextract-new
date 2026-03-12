@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Privacy Policy - TabularExtract</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-zinc-950 text-white p-8 max-w-3xl mx-auto">
+  <h1 class="text-4xl font-bold mb-8">Privacy Policy</h1>
+  <p class="text-zinc-400">Last updated: March 2026</p>
+  <p class="mt-6">We do not store your PDFs or extracted data. Files are processed temporarily and deleted immediately after extraction. Stripe handles all payment information securely. We never sell or share your data.</p>
+</body>
+</html>
