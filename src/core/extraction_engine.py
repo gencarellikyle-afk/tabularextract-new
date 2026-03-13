@@ -102,7 +102,7 @@ async def home():
         const res = await fetch('/upload', { method: 'POST', body: formData });
         const data = await res.json();
 
-        console.log("✅ FULL EXTRACTION DATA FOR QUALITY ANALYSIS:", data); // <--- easy to copy
+        console.log("✅ FULL EXTRACTION DATA FOR QUALITY ANALYSIS:", JSON.stringify(data, null, 2));
 
         let html = `<h2 class="text-4xl font-bold mb-10 text-center">Your ${data.tables.length} Tables</h2>`;
 
