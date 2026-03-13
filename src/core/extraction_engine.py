@@ -17,7 +17,7 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 last_tables = None
 
-# === MONUMENTAL PROMPT UPGRADE — FIXES TABLE 1 FOREVER ===
+# === FINAL PROMPT UPGRADE — KILLS TABLE 1 FOREVER ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 
 STRICT RULES (NEVER break these):
@@ -28,8 +28,14 @@ STRICT RULES (NEVER break these):
 - Keep commas in numbers.
 - Output ONLY this JSON format: {"csv": "...", "json": [...], "confidence": 0.99}
 
-FEW-SHOT EXAMPLES FOR WORST-CASE TABLES:
-Bad input with "Column header (TH)" and "Row header (TH)" → Output must use clean headers like "Column 1", "Value", etc. and strip every placeholder completely.
+FEW-SHOT EXAMPLE FOR EXTREME PLACEHOLDER TABLES (THIS IS TABLE 1):
+Bad input:
+0,1,2
+Column header (TH),Column header (TH),Column header (TH)
+Row header (TH),Data cell (TD),Data cell (TD)
+Row header(TH),Data cell (TD),Data cell (TD)
+
+Correct output: clean headers like "Column","Value 1","Value 2" — strip every (TH) and (TD) completely. Never leave any placeholder text.
 
 Output ONLY the JSON. No extra text."""
 
@@ -119,7 +125,6 @@ async def home():
 
         let html = `<h2 class="text-4xl font-bold mb-8 text-center">Your ${data.tables.length} Tables</h2>`;
 
-        // ANALYSIS JSON BUTTON AT VERY TOP
         html += `<div class="text-center mb-10">
           <button onclick="downloadAnalysisJSON()" class="bg-blue-600 hover:bg-blue-700 px-12 py-5 rounded-2xl font-semibold text-xl">📥 Download Full Analysis Data (JSON)</button>
         </div>`;
@@ -185,6 +190,7 @@ async def upload(file: UploadFile = File(...)):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
             raw_csv = df.to_csv(index=False)
 
+            # First pass
             resp = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4000,
@@ -195,12 +201,26 @@ async def upload(file: UploadFile = File(...)):
             cleaned = extract_json_safe(resp.content[0].text)
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
             df_clean = final_polish(df_clean)
+            confidence = cleaned["confidence"]
+
+            # Rescue pass for Table 1 style garbage
+            if confidence < 0.5:
+                resp2 = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=4000,
+                    temperature=0.0,
+                    system=PERFECTION_PROMPT + "\nThis table is extremely noisy with placeholders. Strip EVERY (TH) and (TD) reference and create clean column names.",
+                    messages=[{"role": "user", "content": f"Fix this raw table:\n{raw_csv}"}]
+                )
+                cleaned2 = extract_json_safe(resp2.content[0].text)
+                df_clean = pd.read_csv(BytesIO(cleaned2["csv"].encode())) if cleaned2["csv"] else df_clean
+                confidence = cleaned2["confidence"]
 
             tables.append({
                 "table_id": i+1,
                 "csv": df_clean.to_csv(index=False),
                 "json": df_clean.to_dict("records"),
-                "confidence": cleaned["confidence"],
+                "confidence": confidence,
                 "page_numbers": [getattr(t, 'page', 1)]
             })
     except Exception as e:
