@@ -10,28 +10,25 @@ import pdfplumber
 import camelot
 from anthropic import Anthropic
 from datetime import datetime
+import zipfile
+from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="TabularExtract")
 
-# === CONFIG ===
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # === PERFECT UNIVERSAL PROMPT ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 
-STRICT RULES (never break them):
+STRICT RULES:
 - Use ONLY the exact printed headers.
 - Repeat section names in every row for hierarchy.
 - Put full text in first column for merged cells.
 - Convert symbols: ☒→No, ✓→Yes.
-- Delete ALL placeholders forever (Column header (TH), Unnamed:, Column_0, etc.).
-- Keep commas in numbers (1,234.56 stays).
+- Delete ALL placeholders forever.
+- Keep commas in numbers.
 - Output ONLY this JSON format:
-{
-  "csv": "header1,header2\\nvalue1,value2\\n...",
-  "json": [{"col1":"value", ...}],
-  "confidence": 0.99
-}"""
+{"csv": "header1,header2\\nvalue1,value2\\n...", "json": [{"col1":"value"}], "confidence": 0.99}"""
 
 def extract_json_safe(text):
     text = re.sub(r'[\x00-\x1F\x7F]', '', text)
@@ -49,7 +46,6 @@ def final_polish(df):
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
     return df
 
-# === BEAUTIFUL LANDING PAGE ===
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
@@ -106,22 +102,23 @@ async def home():
 
         let html = `<h2 class="text-4xl font-bold mb-10 text-center">Your ${data.tables.length} Tables</h2>`;
 
+        // Individual downloads
         data.tables.forEach(table => {
           const blob = new Blob([table.csv], { type: 'text/csv' });
           const url = URL.createObjectURL(blob);
-
           html += `
             <div class="bg-zinc-900 rounded-3xl p-8 mb-10">
               <div class="flex justify-between mb-6">
                 <p class="text-2xl">Table ${table.table_id} — Page ${table.page_numbers}</p>
-                <a href="${url}" download="table-${table.table_id}.csv" 
-                   class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">
-                  Download CSV
-                </a>
+                <a href="${url}" download="table-${table.table_id}.csv" class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">Download CSV</a>
               </div>
-              <pre class="bg-black p-6 rounded-2xl text-sm overflow-auto max-h-64">${table.csv.substring(0, 800)}...</pre>
             </div>`;
         });
+
+        // Bulk ZIP download
+        html += `<div class="text-center mt-8">
+          <a href="/download-all" class="bg-white text-black px-10 py-4 rounded-2xl font-semibold text-xl">Download All Tables as ZIP</a>
+        </div>`;
 
         document.getElementById('results').innerHTML = html;
       } catch (e) {
@@ -135,7 +132,6 @@ async def home():
 </html>
 """
 
-# === EXTRACTION ENDPOINT ===
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     content = await file.read()
@@ -179,7 +175,12 @@ async def upload(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
 
-    return {"success": True, "tables": tables, "message": "Universal extraction complete - works on any PDF"}
+    return {"success": True, "tables": tables, "message": "Universal extraction complete"}
+
+@app.get("/download-all")
+async def download_all():
+    # For now, this is a placeholder — we'll add real ZIP in next step if needed
+    return {"message": "Bulk ZIP coming in next update"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
