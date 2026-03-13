@@ -10,12 +10,13 @@ import pdfplumber
 import camelot
 from anthropic import Anthropic
 import zipfile
-from fastapi import Response
-from io import BytesIO
 
 app = FastAPI(title="TabularExtract")
 
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+# Global for bulk download (simple for testing — we can make it session-based later)
+last_tables = None
 
 # === PERFECT UNIVERSAL PROMPT ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
@@ -134,6 +135,7 @@ async def home():
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
+    global last_tables
     content = await file.read()
     with open("temp.pdf", "wb") as f:
         f.write(content)
@@ -175,13 +177,27 @@ async def upload(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
 
+    last_tables = tables
     return {"success": True, "tables": tables, "message": "Universal extraction complete"}
 
 @app.get("/download-all")
 async def download_all():
-    # This endpoint is called when the user clicks the ZIP button
-    # For now it returns a message — we will make the real ZIP work once you confirm all 29 tables are extracted
-    return {"message": "Bulk ZIP coming in next update — first confirm all tables show"}
+    global last_tables
+    if not last_tables:
+        return JSONResponse({"message": "No tables to download. Upload a PDF first."})
+
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for table in last_tables:
+            filename = f"Table_{table['table_id']}_Page_{table['page_numbers'][0]}.csv"
+            zip_file.writestr(filename, table["csv"])
+
+    zip_buffer.seek(0)
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=all_tables.zip"}
+    )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
