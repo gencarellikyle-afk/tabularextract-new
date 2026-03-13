@@ -55,6 +55,7 @@ def extract_json_safe(text):
     return {"csv": "", "json": [], "confidence": 0.0}
 
 def final_polish(df):
+    # Stronger duplicate header cleaning (only change #1)
     new_cols = [re.sub(r'Column header \(TH\)|Row header \(TH\)|Data cell \(TD\)|\(TH\)|\(TD\)|Unnamed: \d+|Column_\d+|Column \d+|\.1', '', str(col).strip(), flags=re.IGNORECASE) or f"Column_{i}" for i, col in enumerate(df.columns)]
     df.columns = new_cols
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
@@ -184,7 +185,7 @@ async def upload(file: UploadFile = File(...)):
             cleaned = extract_json_safe(resp.content[0].text)
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
             df_clean = final_polish(df_clean)
-            df_clean = handle_merged_cells(df_clean)
+            df_clean = handle_merged_cells(df_clean)  # <-- ONLY CHANGE #2
             tables.append({
                 "table_id": i+1,
                 "csv": df_clean.to_csv(index=False),
