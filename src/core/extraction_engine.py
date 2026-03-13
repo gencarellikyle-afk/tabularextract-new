@@ -16,7 +16,7 @@ app = FastAPI(title="TabularExtract")
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 last_tables = None
 
-# === LIGHTWEIGHT MERGED-CELL FIX (for normal tables only) ===
+# === LIGHTWEIGHT MERGED-CELL FIX ===
 def handle_merged_cells(df):
     if len(df.columns) < 2 or len(df) == 0:
         return df
@@ -27,29 +27,22 @@ def handle_merged_cells(df):
             for row in range(len(df)):
                 if prev.iloc[row] == curr.iloc[row] and prev.iloc[row] != "":
                     df.iloc[row, col_idx] = ""
-        # FORCE-LEFT RULE for the exact leaking patterns in Tables 3,4,12
-        if any("Daniel Radcliffe" in str(x) or "Maggie Smith" in str(x) or "spanning both" in str(x) for x in df.iloc[:,1]):
-            df.iloc[:,0] = df.iloc[:,1].combine_first(df.iloc[:,0])
-            df.iloc[:,1] = ""
     except:
         pass
     return df
 
-# === REFINED PROMPT FOR NORMAL TABLES ===
+# === STAGE 1 PROMPT (fast normal tables) ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 STRICT RULES (NEVER break these):
-- Use ONLY the exact printed headers from the document. NEVER keep any placeholders like Column header (TH), Row header (TH), Data cell (TD), Unnamed:, Column_0, Column 1, etc.
+- Use ONLY the exact printed headers from the document. NEVER output Column_0, Column header, etc.
 - Repeat section names in every row for hierarchy.
-- For merged cells: put the full text in the LEFTMOST column ONLY and leave all right columns blank or repeat the parent header.
+- For merged cells: put full text in LEFTMOST column only.
 - Convert symbols: ☒→No, ✓→Yes.
 - Keep commas in numbers.
-- If the first column is repeated exactly (e.g. “Expenditure by function £ million” twice), use the original header only once and shift all data left.
-- Actor-style or long names that appear in the second column must be moved to the first (leftmost) column; leave the second column blank.
-- Output ONLY this JSON format: {"csv": "...", "json": [...], "confidence": 0.99}
-FEW-SHOT EXAMPLES FOR NORMAL TABLES:
-Merged cell spanning multiple columns → full text in leftmost column only, right columns blank.
-Duplicate header like "Expenditure by function £million.1" → use clean original header only.
-Output ONLY the JSON. No extra text."""
+- Output ONLY this JSON: {"csv": "...", "json": [...], "confidence": 0.99}"""
+
+# === STAGE 2 RESCUE PROMPT (full page context for hard tables) ===
+RESCUE_PROMPT = """You have the FULL PAGE TEXT + raw table. Reconstruct using ONLY exact printed headers visible on the page. Fix duplicates, shifts, merged cells perfectly. Never use Column_0 or generic names. Output ONLY this JSON: {"csv": "...", "json": [...], "confidence": 0.99}"""
 
 def extract_json_safe(text):
     text = re.sub(r'[\x00-\x1F\x7F]', '', text)
@@ -174,7 +167,10 @@ async def upload(file: UploadFile = File(...)):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(content)
             tmp_path = tmp.name
+
+        # Extract all tables + page text once
         tables_list = []
+        page_texts = {}
         try:
             tables_list = camelot.read_pdf(tmp_path, flavor="lattice", line_scale=45, pages='all')
             if len(tables_list) == 0:
@@ -187,10 +183,16 @@ async def upload(file: UploadFile = File(...)):
                     table = page.extract_table()
                     if table:
                         tables_list.append(type('obj', (object,), {'df': pd.DataFrame(table), 'page': page.page_number})())
+                    page_texts[page.page_number] = page.extract_text() or ""
+
         tables = []
         for i, t in enumerate(tables_list):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
             raw_csv = df.to_csv(index=False)
+            page_num = getattr(t, 'page', 1)
+            page_text = page_texts.get(page_num, "")
+
+            # === STAGE 1: Normal fast pass ===
             resp = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4000,
@@ -202,15 +204,37 @@ async def upload(file: UploadFile = File(...)):
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
             df_clean = final_polish(df_clean)
             df_clean = handle_merged_cells(df_clean)
+
+            # === QUALITY GATE → STAGE 2 RESCUE ===
+            cols = [str(c).strip().lower() for c in df_clean.columns]
+            needs_rescue = (cleaned.get("confidence", 0) < 0.95 or
+                            any(c.startswith("column_") or "header" in c for c in cols) or
+                            "column_0" in cols)
+
+            if needs_rescue and page_text:
+                rescue_input = f"Full page text:\n{page_text}\n\nRaw table CSV:\n{raw_csv}"
+                rescue_resp = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=4000,
+                    temperature=0.0,
+                    system=RESCUE_PROMPT,
+                    messages=[{"role": "user", "content": rescue_input}]
+                )
+                cleaned = extract_json_safe(rescue_resp.content[0].text)
+                df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df_clean
+                df_clean = final_polish(df_clean)
+                df_clean = handle_merged_cells(df_clean)
+
             tables.append({
                 "table_id": i+1,
                 "csv": df_clean.to_csv(index=False),
                 "json": df_clean.to_dict("records"),
-                "confidence": cleaned["confidence"],
-                "page_numbers": [getattr(t, 'page', 1)]
+                "confidence": cleaned.get("confidence", 0.99),
+                "page_numbers": [page_num]
             })
+
         last_tables = tables
-        return {"success": True, "tables": tables, "message": "Universal extraction complete"}
+        return {"success": True, "tables": tables, "message": "Universal extraction complete (two-stage rescue active)"}
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
     finally:
