@@ -15,7 +15,6 @@ app = FastAPI(title="TabularExtract")
 
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# Store last extraction for ZIP and quality analysis
 last_tables = None
 
 # === PERFECT UNIVERSAL PROMPT ===
@@ -47,7 +46,7 @@ def final_polish(df):
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
     return df
 
-# === BEAUTIFUL LANDING PAGE ===
+# === BEAUTIFUL LANDING PAGE WITH SEPARATE EXTRACT BUTTON ===
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
@@ -74,6 +73,11 @@ async def home():
       <p class="text-zinc-400">or click to choose a file</p>
     </div>
 
+    <button id="extractBtn" onclick="startExtraction()" 
+            class="mt-8 w-full bg-emerald-600 hover:bg-emerald-700 text-white px-12 py-5 rounded-2xl font-semibold text-2xl hidden">
+      Extract Tables Now
+    </button>
+
     <div id="loading" class="hidden text-center mt-12">
       <div class="animate-spin w-16 h-16 border-4 border-emerald-600 border-t-transparent rounded-full mx-auto"></div>
       <p class="mt-6 text-xl">Extracting perfect tables...</p>
@@ -83,20 +87,30 @@ async def home():
   </div>
 
   <script>
+    let selectedFile = null;
     const uploadArea = document.getElementById('uploadArea');
     const fileInput = document.getElementById('pdf');
+    const extractBtn = document.getElementById('extractBtn');
 
     uploadArea.addEventListener('click', () => fileInput.click());
 
-    fileInput.addEventListener('change', async () => {
-      const file = fileInput.files[0];
-      if (!file) return;
+    fileInput.addEventListener('change', (e) => {
+      selectedFile = e.target.files[0];
+      if (selectedFile) {
+        extractBtn.classList.remove('hidden');
+        extractBtn.textContent = `Extract Tables from ${selectedFile.name}`;
+      }
+    });
+
+    async function startExtraction() {
+      if (!selectedFile) return;
 
       uploadArea.classList.add('hidden');
+      extractBtn.classList.add('hidden');
       document.getElementById('loading').classList.remove('hidden');
 
       const formData = new FormData();
-      formData.append('file', file);
+      formData.append('file', selectedFile);
 
       try {
         const res = await fetch('/upload', { method: 'POST', body: formData });
@@ -104,22 +118,21 @@ async def home():
 
         console.log("✅ FULL EXTRACTION DATA FOR QUALITY ANALYSIS:", JSON.stringify(data, null, 2));
 
-        let html = `<h2 class="text-4xl font-bold mb-10 text-center">Your ${data.tables.length} Tables</h2>`;
+        let html = `<h2 class="text-4xl font-bold mb-8 text-center">Your ${data.tables.length} Tables</h2>`;
 
         data.tables.forEach(table => {
           const blob = new Blob([table.csv], { type: 'text/csv' });
           const url = URL.createObjectURL(blob);
           html += `
-            <div class="bg-zinc-900 rounded-3xl p-8 mb-10">
+            <div class="bg-zinc-900 rounded-3xl p-8 mb-8">
               <div class="flex justify-between mb-6">
                 <p class="text-2xl">Table ${table.table_id} — Page ${table.page_numbers}</p>
-                <a href="${url}" download="table-${table.table_id}.csv" 
-                   class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">Download CSV</a>
+                <a href="${url}" download="table-${table.table_id}.csv" class="bg-emerald-600 hover:bg-emerald-700 px-8 py-4 rounded-2xl font-semibold text-lg">Download CSV</a>
               </div>
             </div>`;
         });
 
-        html += `<div class="text-center mt-12">
+        html += `<div class="text-center mt-10">
           <a href="/download-all" class="bg-white text-black px-12 py-5 rounded-2xl font-semibold text-2xl">Download All Tables as ZIP</a>
         </div>`;
 
@@ -129,7 +142,7 @@ async def home():
       } finally {
         document.getElementById('loading').classList.add('hidden');
       }
-    });
+    }
   </script>
 </body>
 </html>
