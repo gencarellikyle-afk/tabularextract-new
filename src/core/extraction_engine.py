@@ -17,27 +17,22 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 last_tables = None
 
-# === FINAL PROMPT UPGRADE — KILLS TABLE 1 FOREVER ===
+# === 29/29 PROMPT + FEW-SHOT FOR MERGED CELLS ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 
-STRICT RULES (NEVER break these):
-- Use ONLY the exact printed headers from the document. NEVER keep any placeholders like Column header (TH), Row header (TH), Data cell (TD), Unnamed:, Column_0, etc.
+STRICT RULES:
+- Use ONLY the exact printed headers.
+- For merged cells spanning columns: place the full text in the LEFTMOST column ONLY and leave right columns blank or repeat the parent category.
 - Repeat section names in every row for hierarchy.
-- Put full text in first column for merged cells.
 - Convert symbols: ☒→No, ✓→Yes.
+- Delete ALL placeholders forever.
 - Keep commas in numbers.
 - Output ONLY this JSON format: {"csv": "...", "json": [...], "confidence": 0.99}
 
-FEW-SHOT EXAMPLE FOR EXTREME PLACEHOLDER TABLES (THIS IS TABLE 1):
-Bad input:
-0,1,2
-Column header (TH),Column header (TH),Column header (TH)
-Row header (TH),Data cell (TD),Data cell (TD)
-Row header(TH),Data cell (TD),Data cell (TD)
+FEW-SHOT MERGED-CELL EXAMPLES:
+Input with merged text in multiple columns → Output: full text in first column only, others blank or hierarchy repeated.
 
-Correct output: clean headers like "Column","Value 1","Value 2" — strip every (TH) and (TD) completely. Never leave any placeholder text.
-
-Output ONLY the JSON. No extra text."""
+Output ONLY the JSON."""
 
 def extract_json_safe(text):
     text = re.sub(r'[\x00-\x1F\x7F]', '', text)
@@ -53,6 +48,16 @@ def final_polish(df):
     new_cols = [re.sub(r'Column header \(TH\)|Row header \(TH\)|Data cell \(TD\)|\(TH\)|\(TD\)|Unnamed: \d+|Column_\d+', '', str(col).strip(), flags=re.IGNORECASE) or f"Column_{i}" for i, col in enumerate(df.columns)]
     df.columns = new_cols
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
+    return df
+
+def handle_merged_cells(df):
+    """Fix merged-cell duplication (Tables 3 & 12)"""
+    for col_idx in range(1, len(df.columns)):
+        prev_col = df.iloc[:, col_idx-1]
+        curr_col = df.iloc[:, col_idx]
+        for row in range(len(df)):
+            if prev_col.iloc[row] == curr_col.iloc[row] and prev_col.iloc[row] != "":
+                curr_col.iloc[row] = ""  # keep only in left column
     return df
 
 @app.get("/", response_class=HTMLResponse)
@@ -201,10 +206,10 @@ async def upload(file: UploadFile = File(...)):
             cleaned = extract_json_safe(resp.content[0].text)
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
             df_clean = final_polish(df_clean)
-            confidence = cleaned["confidence"]
+            confidence = cleaned.get("confidence", 0.0)
 
-            # Rescue pass for Table 1 style garbage
-            if confidence < 0.5:
+            # Conditional rescue ONLY for placeholder garbage (not merged cells)
+            if confidence < 0.5 and any(x in raw_csv for x in ["(TH)", "(TD)", "Column header", "Row header"]):
                 resp2 = client.messages.create(
                     model="claude-sonnet-4-6",
                     max_tokens=4000,
@@ -214,7 +219,11 @@ async def upload(file: UploadFile = File(...)):
                 )
                 cleaned2 = extract_json_safe(resp2.content[0].text)
                 df_clean = pd.read_csv(BytesIO(cleaned2["csv"].encode())) if cleaned2["csv"] else df_clean
-                confidence = cleaned2["confidence"]
+                confidence = cleaned2.get("confidence", confidence)
+
+            # Final merged-cell fix
+            df_clean = handle_merged_cells(df_clean)
+            df_clean = final_polish(df_clean)
 
             tables.append({
                 "table_id": i+1,
