@@ -17,7 +17,7 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 last_tables = None
 
-# === RESOLUTION PROMPT + FEW-SHOT ===
+# === UNIVERSAL PROMPT + FEW-SHOT FOR COMMON PATTERNS ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 
 STRICT RULES:
@@ -49,7 +49,6 @@ def final_polish(df):
     return df
 
 def handle_merged_cells(df):
-    """Final pass to fix merged-cell duplication (Tables 3 & 12)"""
     for col_idx in range(1, len(df.columns)):
         prev = df.iloc[:, col_idx-1]
         curr = df.iloc[:, col_idx]
@@ -122,6 +121,11 @@ async def home():
       try {
         const res = await fetch('/upload', { method: 'POST', body: formData });
         const data = await res.json();
+
+        if (!data.success || !data.tables) {
+          throw new Error(data.error || "Extraction failed");
+        }
+
         fullData = data;
 
         console.log("✅ FULL EXTRACTION DATA FOR QUALITY ANALYSIS:", JSON.stringify(data, null, 2));
@@ -193,7 +197,6 @@ async def upload(file: UploadFile = File(...)):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
             raw_csv = df.to_csv(index=False)
 
-            # RESCUE TRIGGER ON RAW CONTENT (fixes Table 1 every time)
             if any(x in raw_csv for x in ["(TH)", "(TD)", "Column header", "Row header"]):
                 resp = client.messages.create(
                     model="claude-sonnet-4-6",
@@ -214,8 +217,6 @@ async def upload(file: UploadFile = File(...)):
             cleaned = extract_json_safe(resp.content[0].text)
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
             df_clean = final_polish(df_clean)
-
-            # MERGED-CELL FIX LAST (protects Table 3 & 12)
             df_clean = handle_merged_cells(df_clean)
             df_clean = final_polish(df_clean)
 
@@ -227,7 +228,7 @@ async def upload(file: UploadFile = File(...)):
                 "page_numbers": [getattr(t, 'page', 1)]
             })
     except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)})
+        return JSONResponse({"success": False, "error": str(e), "tables": []})
 
     last_tables = tables
     return {"success": True, "tables": tables, "message": "Universal extraction complete"}
