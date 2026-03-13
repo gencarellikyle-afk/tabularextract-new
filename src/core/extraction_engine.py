@@ -13,10 +13,10 @@ from datetime import datetime
 
 app = FastAPI(title="TabularExtract")
 
-# === CONFIG (use your own keys in Render) ===
+# === CONFIG ===
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# === THE PERFECT UNIVERSAL PROMPT (works on ANY PDF) ===
+# === PERFECT UNIVERSAL PROMPT ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 
 STRICT RULES (never break them):
@@ -49,10 +49,93 @@ def final_polish(df):
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
     return df
 
+# === BEAUTIFUL LANDING PAGE ===
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return """<html><head><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-zinc-950 text-white p-8"><h1 class="text-5xl font-bold">TabularExtract</h1><form id="form"><input type="file" id="pdf"><button type="button" onclick="upload()">Extract Tables</button></form><script>async function upload(){const f=document.getElementById('pdf').files[0];const fd=new FormData();fd.append('file',f);const r=await fetch('/upload',{method:'POST',body:fd});alert('Done! Check console.');}</script></body></html>"""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>TabularExtract - Perfect Tables from Any PDF</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-zinc-950 text-white min-h-screen">
+  <div class="max-w-5xl mx-auto p-8">
+    <h1 class="text-6xl font-bold text-center mb-4">TabularExtract</h1>
+    <p class="text-2xl text-zinc-400 text-center mb-12">Upload any PDF — get perfect tables instantly</p>
 
+    <div id="uploadArea" class="bg-zinc-900 border-2 border-dashed border-zinc-700 rounded-3xl p-16 text-center cursor-pointer">
+      <input type="file" id="pdf" accept="application/pdf" class="hidden">
+      <div class="mx-auto w-16 h-16 mb-6 text-zinc-400">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903 5 5 0 0110.025 1.65L12 13l-.354-.354a2 2 0 01-.293-.293L12 10" />
+        </svg>
+      </div>
+      <p class="text-2xl font-semibold mb-2">Drop your PDF here</p>
+      <p class="text-zinc-400">or click to choose a file</p>
+    </div>
+
+    <div id="loading" class="hidden text-center mt-12">
+      <div class="animate-spin w-16 h-16 border-4 border-emerald-600 border-t-transparent rounded-full mx-auto"></div>
+      <p class="mt-6 text-xl">Extracting perfect tables...</p>
+    </div>
+
+    <div id="results" class="mt-12"></div>
+  </div>
+
+  <script>
+    const uploadArea = document.getElementById('uploadArea');
+    const fileInput = document.getElementById('pdf');
+
+    uploadArea.addEventListener('click', () => fileInput.click());
+
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+
+      uploadArea.classList.add('hidden');
+      document.getElementById('loading').classList.remove('hidden');
+
+      const formData = new FormData();
+      formData.append('file', file);
+
+      try {
+        const res = await fetch('/upload', { method: 'POST', body: formData });
+        const data = await res.json();
+
+        let html = `<h2 class="text-4xl font-bold mb-10 text-center">Your ${data.tables.length} Tables</h2>`;
+
+        data.tables.forEach(table => {
+          const blob = new Blob([table.csv], { type: 'text/csv' });
+          const url = URL.createObjectURL(blob);
+
+          html += `
+            <div class="bg-zinc-900 rounded-3xl p-8 mb-10">
+              <div class="flex justify-between mb-6">
+                <p class="text-2xl">Table ${table.table_id} — Page ${table.page_numbers}</p>
+                <a href="${url}" download="table-${table.table_id}.csv" 
+                   class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">
+                  Download CSV
+                </a>
+              </div>
+              <pre class="bg-black p-6 rounded-2xl text-sm overflow-auto max-h-64">${table.csv.substring(0, 800)}...</pre>
+            </div>`;
+        });
+
+        document.getElementById('results').innerHTML = html;
+      } catch (e) {
+        document.getElementById('results').innerHTML = `<p class="text-red-500 text-center text-2xl">Error: ${e.message}</p>`;
+      } finally {
+        document.getElementById('loading').classList.add('hidden');
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+# === EXTRACTION ENDPOINT ===
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     content = await file.read()
@@ -60,7 +143,6 @@ async def upload(file: UploadFile = File(...)):
         f.write(content)
 
     tables = []
-    # Universal extraction (works on any PDF with 1 or 1000 tables)
     try:
         tables_list = camelot.read_pdf("temp.pdf", flavor="lattice", line_scale=45)
         if len(tables_list) == 0:
@@ -76,7 +158,6 @@ async def upload(file: UploadFile = File(...)):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
             raw_csv = df.to_csv(index=False)
 
-            # Claude perfection pass
             resp = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4000,
