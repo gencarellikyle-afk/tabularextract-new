@@ -17,15 +17,15 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 last_tables = None
 
-# === PERFECT UNIVERSAL PROMPT ===
+# === STRONGER PROMPT TO FIX PLACEHOLDERS AND HIERARCHY ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 
 STRICT RULES:
-- Use ONLY the exact printed headers.
+- Use ONLY the exact printed headers (never placeholders like Row header (TH) or Data cell (TD)).
 - Repeat section names in every row for hierarchy.
 - Put full text in first column for merged cells.
 - Convert symbols: ☒→No, ✓→Yes.
-- Delete ALL placeholders forever.
+- Delete ALL placeholders forever (Column header (TH), Row header (TH), Data cell (TD), Unnamed, Column_0, etc.).
 - Keep commas in numbers.
 - Output ONLY this JSON format:
 {"csv": "header1,header2\\nvalue1,value2\\n...", "json": [{"col1":"value"}], "confidence": 0.99}"""
@@ -124,15 +124,16 @@ async def home():
           const blob = new Blob([table.csv], { type: 'text/csv' });
           const url = URL.createObjectURL(blob);
           html += `
-            <div class="bg-zinc-900 rounded-3xl p-8 mb-8">
+            <div class="bg-zinc-900 rounded-3xl p-8 mb-10">
               <div class="flex justify-between mb-6">
                 <p class="text-2xl">Table ${table.table_id} — Page ${table.page_numbers}</p>
-                <a href="${url}" download="table-${table.table_id}.csv" class="bg-emerald-600 hover:bg-emerald-700 px-8 py-4 rounded-2xl font-semibold text-lg">Download CSV</a>
+                <a href="${url}" download="table-${table.table_id}.csv" 
+                   class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">Download CSV</a>
               </div>
             </div>`;
         });
 
-        html += `<div class="text-center mt-10">
+        html += `<div class="text-center mt-12">
           <a href="/download-all" class="bg-white text-black px-12 py-5 rounded-2xl font-semibold text-2xl">Download All Tables as ZIP</a>
         </div>`;
 
