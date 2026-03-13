@@ -10,6 +10,7 @@ import pdfplumber
 import camelot
 from anthropic import Anthropic
 import zipfile
+import tempfile
 
 app = FastAPI(title="TabularExtract")
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -27,7 +28,7 @@ def handle_merged_cells(df):
                 if prev.iloc[row] == curr.iloc[row] and prev.iloc[row] != "":
                     df.iloc[row, col_idx] = ""
     except:
-        pass  # bulletproof safety — never crashes
+        pass
     return df
 
 # === REFINED PROMPT FOR NORMAL TABLES ===
@@ -55,7 +56,6 @@ def extract_json_safe(text):
     return {"csv": "", "json": [], "confidence": 0.0}
 
 def final_polish(df):
-    # Stronger duplicate header cleaning
     new_cols = [re.sub(r'Column header \(TH\)|Row header \(TH\)|Data cell \(TD\)|\(TH\)|\(TD\)|Unnamed: \d+|Column_\d+|Column \d+|\.1', '', str(col).strip(), flags=re.IGNORECASE) or f"Column_{i}" for i, col in enumerate(df.columns)]
     df.columns = new_cols
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
@@ -114,6 +114,10 @@ async def home():
       try {
         const res = await fetch('/upload', { method: 'POST', body: formData });
         const data = await res.json();
+        if (!data.success) {
+          document.getElementById('results').innerHTML = `<p class="text-red-500 text-center text-2xl">Error: ${data.error || 'Unknown error'}</p>`;
+          return;
+        }
         fullData = data;
         console.log("✅ FULL EXTRACTION DATA FOR QUALITY ANALYSIS:", JSON.stringify(data, null, 2));
         let html = `<h2 class="text-4xl font-bold mb-8 text-center">Your ${data.tables.length} Tables</h2>`;
@@ -158,20 +162,26 @@ async def home():
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     global last_tables
-    content = await file.read()
-    with open("temp.pdf", "wb") as f:
-        f.write(content)
-    tables = []
+    tmp_path = None
     try:
-        tables_list = camelot.read_pdf("temp.pdf", flavor="lattice", line_scale=45, pages='all')
+        content = await file.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        tables_list = []
+        try:
+            tables_list = camelot.read_pdf(tmp_path, flavor="lattice", line_scale=45, pages='all')
+            if len(tables_list) == 0:
+                tables_list = camelot.read_pdf(tmp_path, flavor="stream", pages='all')
+        except:
+            pass
         if len(tables_list) == 0:
-            tables_list = camelot.read_pdf("temp.pdf", flavor="stream", pages='all')
-        if len(tables_list) == 0:
-            with pdfplumber.open("temp.pdf") as pdf:
+            with pdfplumber.open(tmp_path) as pdf:
                 for page in pdf.pages:
                     table = page.extract_table()
                     if table:
                         tables_list.append(type('obj', (object,), {'df': pd.DataFrame(table), 'page': page.page_number})())
+        tables = []
         for i, t in enumerate(tables_list):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
             raw_csv = df.to_csv(index=False)
@@ -193,10 +203,13 @@ async def upload(file: UploadFile = File(...)):
                 "confidence": cleaned["confidence"],
                 "page_numbers": [getattr(t, 'page', 1)]
             })
+        last_tables = tables
+        return {"success": True, "tables": tables, "message": "Universal extraction complete"}
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
-    last_tables = tables
-    return {"success": True, "tables": tables, "message": "Universal extraction complete"}
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 @app.get("/download-all")
 async def download_all():
