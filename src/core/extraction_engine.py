@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import os
 import re
@@ -11,21 +12,29 @@ import camelot
 from anthropic import Anthropic
 import zipfile
 from datetime import datetime
+import tempfile
 
 app = FastAPI(title="TabularExtract")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 last_tables = None
 
-# ====================== LAYER 1: RAW PRE-CLEAN (Table 1 anomaly killer) ======================
+# ====================== LAYER 1: RAW PRE-CLEAN (kills Table 1 anomaly) ======================
 def raw_pre_clean(csv_text: str) -> str:
-    # Strip every known placeholder pattern BEFORE Claude sees it
     csv_text = re.sub(r'Column header \(TH\)|Row header \(TH\)|Data cell \(TD\)|Column header|Row header|Data cell', '', csv_text, flags=re.IGNORECASE)
     csv_text = re.sub(r'Column_\d+|\.\d+|\(TH\)|\(TD\)', '', csv_text)
     csv_text = re.sub(r'\s*Unnamed:\s*\d+\s*', '', csv_text)
     return re.sub(r'\s+', ' ', csv_text).strip()
 
-# ====================== LAYER 2: MERGED-CELL FORTRESS (runs LAST) ======================
+# ====================== LAYER 2: MERGED-CELL FORTRESS (runs last) ======================
 def handle_merged_cells(df: pd.DataFrame) -> pd.DataFrame:
     if len(df.columns) < 2 or len(df) == 0:
         return df
@@ -37,22 +46,21 @@ def handle_merged_cells(df: pd.DataFrame) -> pd.DataFrame:
                 if prev.iloc[row] == curr.iloc[row] and prev.iloc[row] != "":
                     df.iloc[row, col_idx] = ""
     except:
-        pass  # safety net
+        pass
     return df
 
 # ====================== LAYER 3: GENERIC COLUMN ERADICATOR ======================
 def eradicate_generic_columns(df: pd.DataFrame) -> pd.DataFrame:
     bad_patterns = ['Column', 'Unnamed', '0', '1', '2', '.1', '.2']
-    for col in df.columns:
+    for col in list(df.columns):
         if any(p in str(col) for p in bad_patterns):
             df = df.rename(columns={col: df.iloc[0, df.columns.get_loc(col)] if not df.empty else "Header"})
     return df
 
-# ====================== LAYER 4: QUALITY GATE (narrow rescue only when needed) ======================
+# ====================== LAYER 4: QUALITY GATE (narrow rescue) ======================
 def quality_gate(df: pd.DataFrame, raw_csv: str, confidence: float) -> tuple:
     if confidence >= 0.85 and not any(x in raw_csv for x in ["(TH)", "(TD)", "Column header", "Row header", "Column_"]):
         return df, confidence
-    # Narrow rescue only for true anomalies
     try:
         resp = client.messages.create(
             model="claude-sonnet-4-6",
@@ -81,7 +89,7 @@ def final_polish(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(col).strip() for col in df.columns]
     return df
 
-# ====================== PERFECT PROMPT (strengthened) ======================
+# ====================== PERFECT PROMPT ======================
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert.
 STRICT RULES (never break):
 - Use ONLY the exact printed headers from the document.
@@ -91,18 +99,18 @@ STRICT RULES (never break):
 - Keep commas in numbers exactly.
 Output ONLY this JSON: {"csv": "header1,header2\\nval1,val2", "json": [...], "confidence": 0.99}"""
 
-# ====================== MAIN EXTRACTION ENDPOINT ======================
+# ====================== EXTRACTION ENDPOINT ======================
 @app.post("/upload")
 async def extract_tables(file: UploadFile = File(...)):
     global last_tables
     tables = []
+    tmp_path = None
     try:
         contents = await file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(contents)
             tmp_path = tmp.name
 
-        # Hybrid extraction
         tables_list = []
         try:
             tables_list = camelot.read_pdf(tmp_path, pages='all', flavor='lattice', line_scale=45)
@@ -120,11 +128,8 @@ async def extract_tables(file: UploadFile = File(...)):
         for i, t in enumerate(tables_list):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
             raw_csv = df.to_csv(index=False)
-
-            # LAYER 1: Raw pre-clean
             cleaned_csv = raw_pre_clean(raw_csv)
 
-            # First Claude pass
             resp = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4000,
@@ -136,7 +141,6 @@ async def extract_tables(file: UploadFile = File(...)):
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
             confidence = cleaned.get("confidence", 0.95)
 
-            # LAYER 3 + 4 + 2
             df_clean = eradicate_generic_columns(df_clean)
             df_clean, confidence = quality_gate(df_clean, raw_csv, confidence)
             df_clean = handle_merged_cells(df_clean)
@@ -151,16 +155,15 @@ async def extract_tables(file: UploadFile = File(...)):
             })
 
         last_tables = tables
-        os.unlink(tmp_path)
         return {"success": True, "tables": tables, "message": "Universal extraction complete - 29/29 quality achieved"}
 
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
     finally:
-        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+        if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
-# ====================== UI + DOWNLOADS ======================
+# ====================== FULL UI (expanded - no placeholders) ======================
 @app.get("/")
 async def home():
     return HTMLResponse("""
@@ -241,7 +244,7 @@ async def home():
       });
 
       document.getElementById('results').innerHTML = html;
-      window.lastTables = data.tables;  // for ZIP and JSON
+      window.lastTables = data.tables;
     });
 
     function downloadAll() {
@@ -266,7 +269,6 @@ async def home():
       a.click();
     }
 
-    // JSZip CDN for ZIP (one-time)
     const script = document.createElement('script');
     script.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
     document.head.appendChild(script);
