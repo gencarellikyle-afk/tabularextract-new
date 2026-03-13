@@ -59,6 +59,15 @@ def handle_merged_cells(df):
         pass
     return df
 
+def generic_column_cleaner(df):
+    """Eradicate any remaining Column_X or generic names"""
+    new_cols = []
+    for col in df.columns:
+        cleaned = re.sub(r'Column_\d+|\.\d+', '', str(col).strip(), flags=re.IGNORECASE)
+        new_cols.append(cleaned if cleaned else f"Column_{len(new_cols)}")
+    df.columns = new_cols
+    return df
+
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
@@ -199,7 +208,7 @@ async def upload(file: UploadFile = File(...)):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
             raw_csv = df.to_csv(index=False)
 
-            # RESCUE ON RAW CONTENT — fixes Table 1 every time
+            # LAYER 1: RAW PRE-CLEAN + RESCUE TRIGGER
             if any(x in raw_csv for x in ["(TH)", "(TD)", "Column header", "Row header"]):
                 resp = client.messages.create(
                     model="claude-sonnet-4-6",
@@ -219,8 +228,11 @@ async def upload(file: UploadFile = File(...)):
 
             cleaned = extract_json_safe(resp.content[0].text)
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned.get("csv") else df
+
+            # LAYER 2-4: Polish + Merged + Generic Cleaner
             df_clean = final_polish(df_clean)
             df_clean = handle_merged_cells(df_clean)
+            df_clean = generic_column_cleaner(df_clean)
             df_clean = final_polish(df_clean)
 
             tables.append({
