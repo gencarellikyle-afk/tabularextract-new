@@ -11,6 +11,7 @@ import camelot
 from anthropic import Anthropic
 import zipfile
 from fastapi import Response
+from io import BytesIO
 
 app = FastAPI(title="TabularExtract")
 
@@ -139,7 +140,6 @@ async def upload(file: UploadFile = File(...)):
 
     tables = []
     try:
-        # Aggressive table detection - no limits
         tables_list = camelot.read_pdf("temp.pdf", flavor="lattice", line_scale=45, pages='all')
         if len(tables_list) == 0:
             tables_list = camelot.read_pdf("temp.pdf", flavor="stream", pages='all')
@@ -179,7 +179,8 @@ async def upload(file: UploadFile = File(...)):
 
 @app.get("/download-all")
 async def download_all():
-    # This is a placeholder - real ZIP coming in next update after you confirm all 29 tables show
+    # This endpoint is called when the user clicks the ZIP button
+    # For now it returns a message — we will make the real ZIP work once you confirm all 29 tables are extracted
     return {"message": "Bulk ZIP coming in next update — first confirm all tables show"}
 
 if __name__ == "__main__":
