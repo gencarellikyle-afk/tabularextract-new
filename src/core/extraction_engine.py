@@ -17,7 +17,7 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 last_tables = None
 
-# === UNIVERSAL PROMPT ===
+# === FINAL UNIVERSAL PROMPT ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 
 STRICT RULES:
@@ -45,18 +45,18 @@ def final_polish(df):
     return df
 
 def handle_merged_cells(df):
-    """Bulletproof merged-cell fix — only runs on valid DataFrames"""
+    """Bulletproof merged-cell fix — never crashes"""
     if len(df.columns) < 2 or len(df) == 0:
         return df
-    for col_idx in range(1, len(df.columns)):
-        try:
+    try:
+        for col_idx in range(1, len(df.columns)):
             prev = df.iloc[:, col_idx-1]
             curr = df.iloc[:, col_idx]
             for row in range(len(df)):
                 if str(prev.iloc[row]).strip() == str(curr.iloc[row]).strip() and str(prev.iloc[row]).strip() != "":
                     curr.iloc[row] = ""
-        except:
-            pass  # skip if indexing fails
+    except:
+        pass
     return df
 
 @app.get("/", response_class=HTMLResponse)
@@ -199,7 +199,7 @@ async def upload(file: UploadFile = File(...)):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
             raw_csv = df.to_csv(index=False)
 
-            # RESCUE TRIGGER ON RAW CONTENT — fixes Table 1 every single time
+            # RESCUE ON RAW CONTENT — fixes Table 1 every time
             if any(x in raw_csv for x in ["(TH)", "(TD)", "Column header", "Row header"]):
                 resp = client.messages.create(
                     model="claude-sonnet-4-6",
@@ -218,10 +218,8 @@ async def upload(file: UploadFile = File(...)):
                 )
 
             cleaned = extract_json_safe(resp.content[0].text)
-            df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
+            df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned.get("csv") else df
             df_clean = final_polish(df_clean)
-
-            # MERGED-CELL FIX LAST — bulletproof
             df_clean = handle_merged_cells(df_clean)
             df_clean = final_polish(df_clean)
 
