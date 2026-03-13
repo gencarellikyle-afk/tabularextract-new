@@ -41,6 +41,7 @@ STRICT RULES (NEVER break these):
 - Output ONLY this JSON format: {"csv": "...", "json": [...], "confidence": 0.99}
 FEW-SHOT EXAMPLES FOR NORMAL TABLES:
 Merged cell spanning multiple columns → full text in leftmost column only, right columns blank.
+Duplicate header like "Expenditure by function £million.1" → use clean original header only.
 Output ONLY the JSON. No extra text."""
 
 def extract_json_safe(text):
@@ -54,7 +55,7 @@ def extract_json_safe(text):
     return {"csv": "", "json": [], "confidence": 0.0}
 
 def final_polish(df):
-    new_cols = [re.sub(r'Column header \(TH\)|Row header \(TH\)|Data cell \(TD\)|\(TH\)|\(TD\)|Unnamed: \d+|Column_\d+|Column \d+', '', str(col).strip(), flags=re.IGNORECASE) or f"Column_{i}" for i, col in enumerate(df.columns)]
+    new_cols = [re.sub(r'Column header \(TH\)|Row header \(TH\)|Data cell \(TD\)|\(TH\)|\(TD\)|Unnamed: \d+|Column_\d+|Column \d+|\.1', '', str(col).strip(), flags=re.IGNORECASE) or f"Column_{i}" for i, col in enumerate(df.columns)]
     df.columns = new_cols
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
     return df
@@ -183,7 +184,7 @@ async def upload(file: UploadFile = File(...)):
             cleaned = extract_json_safe(resp.content[0].text)
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
             df_clean = final_polish(df_clean)
-            df_clean = handle_merged_cells(df_clean)  # <-- ONLY CHANGE FOR NORMAL TABLES
+            df_clean = handle_merged_cells(df_clean)
             tables.append({
                 "table_id": i+1,
                 "csv": df_clean.to_csv(index=False),
