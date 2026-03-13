@@ -56,7 +56,7 @@ STRICT RULES (NEVER break these):
         return {"csv": "", "json": [], "confidence": 0.0}
 
     def final_polish(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Fixed — no longer destroys real headers like “Expenditure by function £ million” or “Role”."""
+        """Safe polish — protects real headers like “Expenditure by function £ million” and “Role”."""
         if df.empty:
             return df
         new_cols = []
@@ -81,8 +81,8 @@ STRICT RULES (NEVER break these):
         return "\n\n".join(context).strip()
 
     def _needs_rescue(self, df: pd.DataFrame, confidence: float) -> bool:
-        """Strong universal trigger that catches your exact 4 failures (Column_0, invented headers, shifts)."""
-        if confidence < 0.94 or df.empty:
+        """Universal trigger for your exact 4 failing tables."""
+        if confidence < 0.94 or df.empty or len(df.columns) == 0:
             return True
         cols = [str(c).strip().lower() for c in df.columns]
         if any(c.startswith('column_') or c in ['', 'unnamed'] for c in cols):
@@ -120,9 +120,16 @@ STRICT RULES (NEVER break these):
                             tables_raw.append(type('obj', (object,), {'df': pd.DataFrame(table), 'page': page.page_number})())
 
             for idx, t in enumerate(tables_raw):
-                df = getattr(t, 'df', pd.DataFrame(t))
+                # === SAFE DATAFRAME CREATION (fixes the crash) ===
+                df = getattr(t, 'df', None)
+                if df is None:
+                    try:
+                        df = pd.DataFrame(t)
+                    except Exception:
+                        df = pd.DataFrame()
                 if df.empty:
                     continue
+
                 page_num = getattr(t, 'page', 1)
                 raw_csv = df.to_csv(index=False)
 
@@ -135,7 +142,17 @@ STRICT RULES (NEVER break these):
                     messages=[{"role": "user", "content": f"Raw table:\n{raw_csv}"}]
                 )
                 cleaned = self.extract_json_safe(resp.content[0].text)
-                df_clean = pd.read_csv(BytesIO(cleaned.get("csv", raw_csv).encode())) if cleaned.get("csv") else df
+                
+                # === BULLETPROOF CSV READ (fixes DataFrame constructor error) ===
+                csv_str = cleaned.get("csv", raw_csv)
+                if csv_str and csv_str.strip():
+                    try:
+                        df_clean = pd.read_csv(BytesIO(csv_str.encode()))
+                    except Exception:
+                        df_clean = df
+                else:
+                    df_clean = df
+                
                 df_clean = self.final_polish(df_clean)
                 df_clean = self.handle_merged_cells(df_clean)
 
@@ -153,10 +170,16 @@ STRICT RULES (NEVER break these):
                         messages=[{"role": "user", "content": rescue_input}]
                     )
                     cleaned = self.extract_json_safe(rescue_resp.content[0].text)
-                    if cleaned.get("csv"):
-                        df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode()))
-                        df_clean = self.final_polish(df_clean)
-                        df_clean = self.handle_merged_cells(df_clean)
+                    
+                    # === BULLETPROOF CSV READ AGAIN ===
+                    csv_str = cleaned.get("csv", "")
+                    if csv_str and csv_str.strip():
+                        try:
+                            df_clean = pd.read_csv(BytesIO(csv_str.encode()))
+                        except Exception:
+                            pass  # keep stage 1 result
+                    df_clean = self.final_polish(df_clean)
+                    df_clean = self.handle_merged_cells(df_clean)
 
                 tables_list.append({
                     "table_id": idx + 1,
@@ -175,7 +198,6 @@ STRICT RULES (NEVER break these):
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
-# === YOUR EXACT FRONTEND (unchanged) ===
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
