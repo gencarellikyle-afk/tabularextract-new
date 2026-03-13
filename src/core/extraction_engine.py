@@ -15,7 +15,7 @@ app = FastAPI(title="TabularExtract")
 
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# Store last extraction for ZIP download
+# Store last extraction for ZIP and quality analysis
 last_tables = None
 
 # === PERFECT UNIVERSAL PROMPT ===
@@ -101,6 +101,8 @@ async def home():
       try {
         const res = await fetch('/upload', { method: 'POST', body: formData });
         const data = await res.json();
+
+        console.log("✅ FULL EXTRACTION DATA FOR QUALITY ANALYSIS:", data); // <--- easy to copy
 
         let html = `<h2 class="text-4xl font-bold mb-10 text-center">Your ${data.tables.length} Tables</h2>`;
 
