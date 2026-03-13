@@ -20,12 +20,12 @@ last_tables = None
 # === STRONGER PROMPT TO FIX PLACEHOLDERS AND HIERARCHY ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 
-STRICT RULES:
-- Use ONLY the exact printed headers (never placeholders like Row header (TH) or Data cell (TD)).
+STRICT RULES (never break these):
+- Use ONLY the exact printed headers from the document (never placeholders like Row header (TH), Data cell (TD), Column header (TH), Unnamed:, Column_0).
 - Repeat section names in every row for hierarchy.
 - Put full text in first column for merged cells.
 - Convert symbols: ☒→No, ✓→Yes.
-- Delete ALL placeholders forever (Column header (TH), Row header (TH), Data cell (TD), Unnamed, Column_0, etc.).
+- Delete ALL placeholders forever.
 - Keep commas in numbers.
 - Output ONLY this JSON format:
 {"csv": "header1,header2\\nvalue1,value2\\n...", "json": [{"col1":"value"}], "confidence": 0.99}"""
@@ -46,7 +46,7 @@ def final_polish(df):
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
     return df
 
-# === BEAUTIFUL LANDING PAGE WITH SEPARATE EXTRACT BUTTON ===
+# === BEAUTIFUL LANDING PAGE WITH SEPARATE EXTRACT BUTTON AND TOP DOWNLOADS ===
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
