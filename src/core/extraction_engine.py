@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import uvicorn
 import os
 import re
@@ -9,9 +9,8 @@ from io import BytesIO
 import pdfplumber
 import camelot
 from anthropic import Anthropic
-from datetime import datetime
 import zipfile
-from fastapi.responses import StreamingResponse
+from fastapi import Response
 
 app = FastAPI(title="TabularExtract")
 
@@ -46,6 +45,7 @@ def final_polish(df):
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
     return df
 
+# === BEAUTIFUL LANDING PAGE ===
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
@@ -102,7 +102,6 @@ async def home():
 
         let html = `<h2 class="text-4xl font-bold mb-10 text-center">Your ${data.tables.length} Tables</h2>`;
 
-        // Individual downloads
         data.tables.forEach(table => {
           const blob = new Blob([table.csv], { type: 'text/csv' });
           const url = URL.createObjectURL(blob);
@@ -110,14 +109,14 @@ async def home():
             <div class="bg-zinc-900 rounded-3xl p-8 mb-10">
               <div class="flex justify-between mb-6">
                 <p class="text-2xl">Table ${table.table_id} — Page ${table.page_numbers}</p>
-                <a href="${url}" download="table-${table.table_id}.csv" class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">Download CSV</a>
+                <a href="${url}" download="table-${table.table_id}.csv" 
+                   class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">Download CSV</a>
               </div>
             </div>`;
         });
 
-        // Bulk ZIP download
-        html += `<div class="text-center mt-8">
-          <a href="/download-all" class="bg-white text-black px-10 py-4 rounded-2xl font-semibold text-xl">Download All Tables as ZIP</a>
+        html += `<div class="text-center mt-12">
+          <a href="/download-all" class="bg-white text-black px-12 py-5 rounded-2xl font-semibold text-2xl">Download All Tables as ZIP</a>
         </div>`;
 
         document.getElementById('results').innerHTML = html;
@@ -179,8 +178,8 @@ async def upload(file: UploadFile = File(...)):
 
 @app.get("/download-all")
 async def download_all():
-    # For now, this is a placeholder — we'll add real ZIP in next step if needed
-    return {"message": "Bulk ZIP coming in next update"}
+    # This is a placeholder for now — we'll make the real ZIP work in the next update after you confirm all 29 tables appear
+    return {"message": "Bulk ZIP coming in next update — first confirm all tables show"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
