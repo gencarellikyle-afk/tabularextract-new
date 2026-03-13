@@ -1,34 +1,43 @@
-import sys
-from pathlib import Path
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+import uvicorn
 import os
-
-print("DEBUG: Current dir =", os.getcwd())
-print("DEBUG: Files in /app =", os.listdir("/app") if os.path.exists("/app") else "no /app")
-if os.path.exists("/app/src"):
-    print("DEBUG: Files in /app/src =", os.listdir("/app/src"))
-if os.path.exists("/app/src/core"):
-    print("DEBUG: Files in /app/src/core =", os.listdir("/app/src/core"))
-
-# Strongest path fix
-base_dir = Path(__file__).resolve().parent
-sys.path = [
-    str(base_dir),
-    str(base_dir / "src"),
-    "/app",
-    "/app/src",
-    str(base_dir / "src" / "core"),
-    ""
-] + sys.path
-
-print("DEBUG: Final PYTHON PATH =", sys.path)
-
-from fastapi import FastAPI
-from src.core.extraction_engine import app as engine_app
+from io import BytesIO
+import zipfile
+import tempfile
+from src.core.extraction_engine import TableExtractionEngine
 
 app = FastAPI(title="TabularExtract")
+last_tables = None
 
-app.mount("/", engine_app)
+# === YOUR EXACT FRONTEND (unchanged) ===
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return """[PASTE YOUR ENTIRE HTML/JS BLOCK FROM THE SUMMARY HERE — it's identical]"""
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    global last_tables
+    try:
+        content = await file.read()
+        engine = TableExtractionEngine()
+        result = engine.extract_tables(content)
+        last_tables = result.get("tables", [])
+        return result
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+@app.get("/download-all")
+async def download_all():
+    global last_tables
+    if not last_tables:
+        return JSONResponse({"message": "No tables yet."})
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        for t in last_tables:
+            z.writestr(f"Table_{t['table_id']}_Page_{t['page_numbers'][0]}.csv", t["csv"])
+    zip_buffer.seek(0)
+    return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": "attachment; filename=all_tables.zip"})
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
