@@ -22,15 +22,17 @@ class TableExtractionEngine:
         
         self.PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 STRICT RULES (NEVER break these):
-- Use ONLY the exact printed headers from the document. NEVER output Column_0, Column header, Column_, Row header (TH), Data cell (TD), .1, .2, or any placeholder.
+- Use ONLY the exact printed headers from the document. NEVER output Column_0, Column_, Row header (TH), Data cell (TD), .1, .2 or any placeholder.
+- NEVER combine multiple tables in one output.
 - Repeat section names in every row for hierarchy.
 - For merged cells: put full text in LEFTMOST column only.
 - Convert symbols: ☒→No, ✓→Yes.
 - Keep commas in numbers.
 - Output ONLY this JSON: {"csv": "...", "json": [...], "confidence": 0.99}"""
 
-        self.RESCUE_PROMPT = """You have the FULL PAGE TEXT + raw table. Reconstruct using ONLY exact printed headers visible on the page. Fix duplicates, shifts, merged cells perfectly. 
-NEVER use Column_0, Column header, Row header (TH), Data cell (TD), .1, .2 or any placeholder. Output ONLY this JSON: {"csv": "...", "json": [...], "confidence": 0.99}"""
+        self.RESCUE_PROMPT = """You have the FULL PAGE TEXT + raw table. Reconstruct using ONLY exact printed headers visible on the page. 
+NEVER combine multiple tables. Fix duplicates, shifts, merged cells perfectly. 
+NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this JSON: {"csv": "...", "json": [...], "confidence": 0.99}"""
 
     def handle_merged_cells(self, df: pd.DataFrame) -> pd.DataFrame:
         if len(df.columns) < 2 or len(df) == 0:
@@ -57,7 +59,6 @@ NEVER use Column_0, Column header, Row header (TH), Data cell (TD), .1, .2 or an
         return {"csv": "", "json": [], "confidence": 0.0}
 
     def final_polish(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Ultra-strong polish — kills every placeholder (TH, TD, Column_, .1, .2) while protecting real headers."""
         if df.empty:
             return df
         new_cols = []
@@ -69,6 +70,12 @@ NEVER use Column_0, Column header, Row header (TH), Data cell (TD), .1, .2 or an
         df.columns = new_cols
         df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
         return df
+
+    def csv_repair(self, csv_str: str) -> str:
+        """Fixes common Claude number-splitting and quote errors deterministically."""
+        csv_str = re.sub(r'"(\d+),(\d+)"', r'\1\2', csv_str)
+        csv_str = re.sub(r'""(\d+),(\d+)""', r'"\1\2"', csv_str)
+        return csv_str
 
     def _get_full_page_context(self, pdf_path: str, page_numbers: List[int]) -> str:
         context = []
@@ -82,16 +89,12 @@ NEVER use Column_0, Column header, Row header (TH), Data cell (TD), .1, .2 or an
         return "\n\n".join(context).strip()
 
     def _needs_rescue(self, df: pd.DataFrame, confidence: float) -> bool:
-        """Extra aggressive — catches every remaining failure (Table 1, 10, 26)."""
-        if confidence < 0.94 or df.empty or len(df.columns) == 0:
+        if confidence < 0.92 or df.empty or len(df.columns) == 0:
             return True
         cols = [str(c).strip().lower() for c in df.columns]
         if any(c.startswith('column_') or '(th)' in c or '(td)' in c or c in ['', 'unnamed', '.1', '.2'] for c in cols):
             return True
         if len(cols) > 0 and (cols[0].replace(',', '').replace('.', '').isdigit() or any(x.isdigit() for x in cols[0].split())):
-            return True
-        empty_ratio = sum(1 for c in cols if not c) / len(cols)
-        if empty_ratio > 0.25:
             return True
         return False
 
@@ -143,7 +146,7 @@ NEVER use Column_0, Column header, Row header (TH), Data cell (TD), .1, .2 or an
                 )
                 cleaned = self.extract_json_safe(resp.content[0].text)
                 
-                csv_str = cleaned.get("csv", raw_csv)
+                csv_str = self.csv_repair(cleaned.get("csv", raw_csv))
                 if csv_str and csv_str.strip():
                     try:
                         df_clean = pd.read_csv(BytesIO(csv_str.encode()))
@@ -170,7 +173,7 @@ NEVER use Column_0, Column header, Row header (TH), Data cell (TD), .1, .2 or an
                     )
                     cleaned = self.extract_json_safe(rescue_resp.content[0].text)
                     
-                    csv_str = cleaned.get("csv", "")
+                    csv_str = self.csv_repair(cleaned.get("csv", ""))
                     if csv_str and csv_str.strip():
                         try:
                             df_clean = pd.read_csv(BytesIO(csv_str.encode()))
@@ -178,6 +181,9 @@ NEVER use Column_0, Column header, Row header (TH), Data cell (TD), .1, .2 or an
                             pass
                     df_clean = self.final_polish(df_clean)
                     df_clean = self.handle_merged_cells(df_clean)
+
+                # Final deterministic guardrail
+                df_clean = self.final_polish(df_clean)
 
                 tables_list.append({
                     "table_id": idx + 1,
@@ -190,7 +196,7 @@ NEVER use Column_0, Column header, Row header (TH), Data cell (TD), .1, .2 or an
             return {
                 "success": True,
                 "tables": tables_list,
-                "message": "Universal extraction complete (two-stage rescue)"
+                "message": "Universal extraction complete (two-stage rescue + guardrails)"
             }
         finally:
             if tmp_path and os.path.exists(tmp_path):
