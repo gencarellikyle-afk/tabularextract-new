@@ -15,7 +15,7 @@ app = FastAPI(title="TabularExtract")
 
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# Global for bulk download (simple for testing — we can make it session-based later)
+# Store last extraction for ZIP download
 last_tables = None
 
 # === PERFECT UNIVERSAL PROMPT ===
@@ -183,7 +183,7 @@ async def upload(file: UploadFile = File(...)):
 @app.get("/download-all")
 async def download_all():
     global last_tables
-    if not last_tables:
+    if not last_tables or len(last_tables) == 0:
         return JSONResponse({"message": "No tables to download. Upload a PDF first."})
 
     zip_buffer = BytesIO()
