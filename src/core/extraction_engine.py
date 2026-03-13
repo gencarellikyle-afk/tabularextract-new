@@ -15,7 +15,22 @@ app = FastAPI(title="TabularExtract")
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 last_tables = None
 
-# === THE REAL SOLUTION PROMPT (stronger + rescue-ready) ===
+# === LIGHTWEIGHT MERGED-CELL FIX (for normal tables only) ===
+def handle_merged_cells(df):
+    if len(df.columns) < 2 or len(df) == 0:
+        return df
+    try:
+        for col_idx in range(1, len(df.columns)):
+            prev = df.iloc[:, col_idx-1].astype(str).str.strip()
+            curr = df.iloc[:, col_idx].astype(str).str.strip()
+            for row in range(len(df)):
+                if prev.iloc[row] == curr.iloc[row] and prev.iloc[row] != "":
+                    df.iloc[row, col_idx] = ""
+    except:
+        pass
+    return df
+
+# === REFINED PROMPT FOR NORMAL TABLES ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 STRICT RULES (NEVER break these):
 - Use ONLY the exact printed headers from the document. NEVER keep any placeholders like Column header (TH), Row header (TH), Data cell (TD), Unnamed:, Column_0, Column 1, etc.
@@ -24,9 +39,7 @@ STRICT RULES (NEVER break these):
 - Convert symbols: ☒→No, ✓→Yes.
 - Keep commas in numbers.
 - Output ONLY this JSON format: {"csv": "...", "json": [...], "confidence": 0.99}
-FEW-SHOT EXAMPLES:
-Bad input with "Column header (TH)" and "Row header (TH)" → Output must use clean headers like "Column 1", "Value", etc. and strip every placeholder completely.
-Worst-case Table 1 garbage with Column_0/Column_1/Row header → strip everything and use clean sequential Column 1, Column 2, Value.
+FEW-SHOT EXAMPLES FOR NORMAL TABLES:
 Merged cell spanning multiple columns → full text in leftmost column only, right columns blank.
 Output ONLY the JSON. No extra text."""
 
@@ -45,23 +58,6 @@ def final_polish(df):
     df.columns = new_cols
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
     return df
-
-# === CONDITIONAL RESCUE PASS — ONLY FOR TABLE 1 ANOMALY ===
-def rescue_if_needed(raw_csv, cleaned_csv):
-    if not any(x in cleaned_csv for x in ["Column header", "Row header", "Data cell", "Column_", "Column 1"]):
-        return cleaned_csv
-    try:
-        resp = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            temperature=0.0,
-            system="Fix ONLY remaining placeholders. Use clean headers. Output ONLY the JSON format.",
-            messages=[{"role": "user", "content": f"Raw: {raw_csv[:2000]}"}]
-        )
-        cleaned = extract_json_safe(resp.content[0].text)
-        return cleaned["csv"] if cleaned["csv"] else cleaned_csv
-    except:
-        return cleaned_csv
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -187,11 +183,7 @@ async def upload(file: UploadFile = File(...)):
             cleaned = extract_json_safe(resp.content[0].text)
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
             df_clean = final_polish(df_clean)
-            # === CONDITIONAL RESCUE — ONLY FOR TABLE 1 ANOMALY ===
-            cleaned_csv = df_clean.to_csv(index=False)
-            if any(x in cleaned_csv for x in ["Column header", "Row header", "Data cell", "Column_"]):
-                final_csv = rescue_if_needed(raw_csv, cleaned_csv)
-                df_clean = pd.read_csv(BytesIO(final_csv.encode())) if final_csv else df_clean
+            df_clean = handle_merged_cells(df_clean)  # <-- ONLY CHANGE FOR NORMAL TABLES
             tables.append({
                 "table_id": i+1,
                 "csv": df_clean.to_csv(index=False),
