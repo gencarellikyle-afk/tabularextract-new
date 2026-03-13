@@ -10,7 +10,7 @@ import pdfplumber
 import camelot
 from anthropic import Anthropic
 import zipfile
-import tempfile
+import time
 
 app = FastAPI(title="TabularExtract")
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -31,7 +31,6 @@ def handle_merged_cells(df):
         pass
     return df
 
-# === REFINED PROMPT FOR NORMAL TABLES ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 STRICT RULES (NEVER break these):
 - Use ONLY the exact printed headers from the document. NEVER keep any placeholders like Column header (TH), Row header (TH), Data cell (TD), Unnamed:, Column_0, Column 1, etc.
@@ -162,36 +161,39 @@ async def home():
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     global last_tables
-    tmp_path = None
+    content = await file.read()
+    with open("temp.pdf", "wb") as f:
+        f.write(content)
+    tables = []
     try:
-        content = await file.read()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        tables_list = []
-        try:
-            tables_list = camelot.read_pdf(tmp_path, flavor="lattice", line_scale=45, pages='all')
-            if len(tables_list) == 0:
-                tables_list = camelot.read_pdf(tmp_path, flavor="stream", pages='all')
-        except:
-            pass
+        tables_list = camelot.read_pdf("temp.pdf", flavor="lattice", line_scale=45, pages='all')
         if len(tables_list) == 0:
-            with pdfplumber.open(tmp_path) as pdf:
+            tables_list = camelot.read_pdf("temp.pdf", flavor="stream", pages='all')
+        if len(tables_list) == 0:
+            with pdfplumber.open("temp.pdf") as pdf:
                 for page in pdf.pages:
                     table = page.extract_table()
                     if table:
                         tables_list.append(type('obj', (object,), {'df': pd.DataFrame(table), 'page': page.page_number})())
-        tables = []
         for i, t in enumerate(tables_list):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
             raw_csv = df.to_csv(index=False)
-            resp = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4000,
-                temperature=0.0,
-                system=PERFECTION_PROMPT,
-                messages=[{"role": "user", "content": f"Fix this raw table:\n{raw_csv}"}]
-            )
+            # Retry wrapper for Anthropic overload
+            for attempt in range(3):
+                try:
+                    resp = client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=4000,
+                        temperature=0.0,
+                        system=PERFECTION_PROMPT,
+                        messages=[{"role": "user", "content": f"Fix this raw table:\n{raw_csv}"}]
+                    )
+                    break
+                except Exception as e:
+                    if "overloaded" in str(e).lower() and attempt < 2:
+                        time.sleep(2)  # wait 2 seconds and retry
+                    else:
+                        raise
             cleaned = extract_json_safe(resp.content[0].text)
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
             df_clean = final_polish(df_clean)
@@ -203,13 +205,10 @@ async def upload(file: UploadFile = File(...)):
                 "confidence": cleaned["confidence"],
                 "page_numbers": [getattr(t, 'page', 1)]
             })
-        last_tables = tables
-        return {"success": True, "tables": tables, "message": "Universal extraction complete"}
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+    last_tables = tables
+    return {"success": True, "tables": tables, "message": "Universal extraction complete"}
 
 @app.get("/download-all")
 async def download_all():
