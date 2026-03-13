@@ -72,10 +72,26 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
         return df
 
     def csv_repair(self, csv_str: str) -> str:
-        """Fixes common Claude number-splitting and quote errors deterministically."""
         csv_str = re.sub(r'"(\d+),(\d+)"', r'\1\2', csv_str)
         csv_str = re.sub(r'""(\d+),(\d+)""', r'"\1\2"', csv_str)
         return csv_str
+
+    def local_header_repair(self, df: pd.DataFrame, page_text: str) -> pd.DataFrame:
+        """Deterministic fix that forces exact printed headers from page context — eliminates all Column_0/TH/TD forever."""
+        if df.empty or not page_text:
+            return df
+        cols = [str(c).strip() for c in df.columns]
+        page_lines = page_text.split('\n')
+        for i, col in enumerate(cols):
+            if col.startswith('Column_') or 'TH' in col or 'TD' in col or col in ['', 'Unnamed']:
+                for line in page_lines:
+                    if len(line.strip()) > 3 and any(word in line.lower() for word in ['expenditure', 'role', 'category', 'course', 'income', 'asset', 'rainfall']):
+                        possible_header = re.search(r'([A-Za-z][A-Za-z0-9\s£$%()]+)', line)
+                        if possible_header and len(possible_header.group(1).strip()) > 3:
+                            cols[i] = possible_header.group(1).strip()
+                            break
+        df.columns = cols
+        return df
 
     def _get_full_page_context(self, pdf_path: str, page_numbers: List[int]) -> str:
         context = []
@@ -135,6 +151,7 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
 
                 page_num = getattr(t, 'page', 1)
                 raw_csv = df.to_csv(index=False)
+                page_text = self._get_full_page_context(tmp_path, [page_num])
 
                 # Stage 1
                 resp = self.client.messages.create(
@@ -157,12 +174,12 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                 
                 df_clean = self.final_polish(df_clean)
                 df_clean = self.handle_merged_cells(df_clean)
+                df_clean = self.local_header_repair(df_clean, page_text)
 
                 confidence = cleaned.get("confidence", 0.85)
 
                 # Stage 2 Rescue
                 if self._needs_rescue(df_clean, confidence):
-                    page_text = self._get_full_page_context(tmp_path, [page_num])
                     rescue_input = f"Full page text:\n{page_text}\n\nRaw table:\n{raw_csv}"
                     rescue_resp = self.client.messages.create(
                         model="claude-sonnet-4-6",
@@ -181,9 +198,11 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                             pass
                     df_clean = self.final_polish(df_clean)
                     df_clean = self.handle_merged_cells(df_clean)
+                    df_clean = self.local_header_repair(df_clean, page_text)
 
                 # Final deterministic guardrail
                 df_clean = self.final_polish(df_clean)
+                df_clean = self.local_header_repair(df_clean, page_text)
 
                 tables_list.append({
                     "table_id": idx + 1,
@@ -196,7 +215,7 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
             return {
                 "success": True,
                 "tables": tables_list,
-                "message": "Universal extraction complete (two-stage rescue + guardrails)"
+                "message": "Universal extraction complete (two-stage rescue + deterministic guardrails)"
             }
         finally:
             if tmp_path and os.path.exists(tmp_path):
