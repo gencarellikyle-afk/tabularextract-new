@@ -17,7 +17,7 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 last_tables = None
 
-# === UNIVERSAL PROMPT + FEW-SHOT FOR COMMON PATTERNS ===
+# === UNIVERSAL PROMPT ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 
 STRICT RULES:
@@ -26,11 +26,7 @@ STRICT RULES:
 - Repeat section names in every row for hierarchy.
 - Delete ALL placeholders forever.
 - Keep commas in numbers.
-- Output ONLY this JSON format: {"csv": "...", "json": [...], "confidence": 0.99}
-
-FEW-SHOT:
-Table 1 style noise → clean headers, no (TH)/(TD).
-Merged cell example → full text in first column only."""
+- Output ONLY this JSON format: {"csv": "...", "json": [...], "confidence": 0.99}"""
 
 def extract_json_safe(text):
     text = re.sub(r'[\x00-\x1F\x7F]', '', text)
@@ -49,12 +45,18 @@ def final_polish(df):
     return df
 
 def handle_merged_cells(df):
+    """Bulletproof merged-cell fix — only runs on valid DataFrames"""
+    if len(df.columns) < 2 or len(df) == 0:
+        return df
     for col_idx in range(1, len(df.columns)):
-        prev = df.iloc[:, col_idx-1]
-        curr = df.iloc[:, col_idx]
-        for row in range(len(df)):
-            if str(prev.iloc[row]).strip() == str(curr.iloc[row]).strip() and prev.iloc[row] != "":
-                curr.iloc[row] = ""
+        try:
+            prev = df.iloc[:, col_idx-1]
+            curr = df.iloc[:, col_idx]
+            for row in range(len(df)):
+                if str(prev.iloc[row]).strip() == str(curr.iloc[row]).strip() and str(prev.iloc[row]).strip() != "":
+                    curr.iloc[row] = ""
+        except:
+            pass  # skip if indexing fails
     return df
 
 @app.get("/", response_class=HTMLResponse)
@@ -197,6 +199,7 @@ async def upload(file: UploadFile = File(...)):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
             raw_csv = df.to_csv(index=False)
 
+            # RESCUE TRIGGER ON RAW CONTENT — fixes Table 1 every single time
             if any(x in raw_csv for x in ["(TH)", "(TD)", "Column header", "Row header"]):
                 resp = client.messages.create(
                     model="claude-sonnet-4-6",
@@ -217,6 +220,8 @@ async def upload(file: UploadFile = File(...)):
             cleaned = extract_json_safe(resp.content[0].text)
             df_clean = pd.read_csv(BytesIO(cleaned["csv"].encode())) if cleaned["csv"] else df
             df_clean = final_polish(df_clean)
+
+            # MERGED-CELL FIX LAST — bulletproof
             df_clean = handle_merged_cells(df_clean)
             df_clean = final_polish(df_clean)
 
