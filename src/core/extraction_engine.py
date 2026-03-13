@@ -139,15 +139,16 @@ async def upload(file: UploadFile = File(...)):
 
     tables = []
     try:
-        tables_list = camelot.read_pdf("temp.pdf", flavor="lattice", line_scale=45)
+        # Aggressive table detection - no limits
+        tables_list = camelot.read_pdf("temp.pdf", flavor="lattice", line_scale=45, pages='all')
         if len(tables_list) == 0:
-            tables_list = camelot.read_pdf("temp.pdf", flavor="stream")
+            tables_list = camelot.read_pdf("temp.pdf", flavor="stream", pages='all')
         if len(tables_list) == 0:
             with pdfplumber.open("temp.pdf") as pdf:
                 for page in pdf.pages:
                     table = page.extract_table()
                     if table:
-                        tables_list.append(type('obj', (object,), {'df': pd.DataFrame(table)})())
+                        tables_list.append(type('obj', (object,), {'df': pd.DataFrame(table), 'page': page.page_number})())
 
         for i, t in enumerate(tables_list):
             df = t.df if hasattr(t, 'df') else pd.DataFrame(t)
@@ -178,7 +179,7 @@ async def upload(file: UploadFile = File(...)):
 
 @app.get("/download-all")
 async def download_all():
-    # This is a placeholder for now — we'll make the real ZIP work in the next update after you confirm all 29 tables appear
+    # This is a placeholder - real ZIP coming in next update after you confirm all 29 tables show
     return {"message": "Bulk ZIP coming in next update — first confirm all tables show"}
 
 if __name__ == "__main__":
