@@ -17,18 +17,21 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 last_tables = None
 
-# === STRONGER PROMPT TO FIX PLACEHOLDERS AND HIERARCHY ===
+# === MONUMENTAL PROMPT UPGRADE — FIXES TABLE 1 FOREVER ===
 PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
 
-STRICT RULES (never break these):
-- Use ONLY the exact printed headers from the document (never placeholders like Row header (TH), Data cell (TD), Column header (TH), Unnamed:, Column_0).
+STRICT RULES (NEVER break these):
+- Use ONLY the exact printed headers from the document. NEVER keep any placeholders like Column header (TH), Row header (TH), Data cell (TD), Unnamed:, Column_0, etc.
 - Repeat section names in every row for hierarchy.
 - Put full text in first column for merged cells.
 - Convert symbols: ☒→No, ✓→Yes.
-- Delete ALL placeholders forever.
 - Keep commas in numbers.
-- Output ONLY this JSON format:
-{"csv": "header1,header2\\nvalue1,value2\\n...", "json": [{"col1":"value"}], "confidence": 0.99}"""
+- Output ONLY this JSON format: {"csv": "...", "json": [...], "confidence": 0.99}
+
+FEW-SHOT EXAMPLES FOR WORST-CASE TABLES:
+Bad input with "Column header (TH)" and "Row header (TH)" → Output must use clean headers like "Column 1", "Value", etc. and strip every placeholder completely.
+
+Output ONLY the JSON. No extra text."""
 
 def extract_json_safe(text):
     text = re.sub(r'[\x00-\x1F\x7F]', '', text)
@@ -41,12 +44,11 @@ def extract_json_safe(text):
     return {"csv": "", "json": [], "confidence": 0.0}
 
 def final_polish(df):
-    new_cols = [re.sub(r'Column header \(TH\)|Row header \(TH\)|Data cell \(TD\)|\(TH\)|\(TD\)|Unnamed: \d+|Column_\d+', '', str(col).strip(), flags=re.IGNORECASE) or "Column" for col in df.columns]
+    new_cols = [re.sub(r'Column header \(TH\)|Row header \(TH\)|Data cell \(TD\)|\(TH\)|\(TD\)|Unnamed: \d+|Column_\d+', '', str(col).strip(), flags=re.IGNORECASE) or f"Column_{i}" for i, col in enumerate(df.columns)]
     df.columns = new_cols
     df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
     return df
 
-# === BEAUTIFUL LANDING PAGE WITH SEPARATE EXTRACT BUTTON AND TOP DOWNLOADS ===
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
@@ -64,17 +66,12 @@ async def home():
 
     <div id="uploadArea" class="bg-zinc-900 border-2 border-dashed border-zinc-700 rounded-3xl p-16 text-center cursor-pointer">
       <input type="file" id="pdf" accept="application/pdf" class="hidden">
-      <div class="mx-auto w-16 h-16 mb-6 text-zinc-400">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903 5 5 0 0110.025 1.65L12 13l-.354-.354a2 2 0 01-.293-.293L12 10" />
-        </svg>
-      </div>
+      <div class="mx-auto w-16 h-16 mb-6 text-zinc-400">📤</div>
       <p class="text-2xl font-semibold mb-2">Drop your PDF here</p>
       <p class="text-zinc-400">or click to choose a file</p>
     </div>
 
-    <button id="extractBtn" onclick="startExtraction()" 
-            class="mt-8 w-full bg-emerald-600 hover:bg-emerald-700 text-white px-12 py-5 rounded-2xl font-semibold text-2xl hidden">
+    <button id="extractBtn" onclick="startExtraction()" class="mt-8 w-full bg-emerald-600 hover:bg-emerald-700 text-white px-12 py-5 rounded-2xl font-semibold text-2xl hidden">
       Extract Tables Now
     </button>
 
@@ -88,6 +85,7 @@ async def home():
 
   <script>
     let selectedFile = null;
+    let fullData = null;
     const uploadArea = document.getElementById('uploadArea');
     const fileInput = document.getElementById('pdf');
     const extractBtn = document.getElementById('extractBtn');
@@ -115,20 +113,25 @@ async def home():
       try {
         const res = await fetch('/upload', { method: 'POST', body: formData });
         const data = await res.json();
+        fullData = data;
 
         console.log("✅ FULL EXTRACTION DATA FOR QUALITY ANALYSIS:", JSON.stringify(data, null, 2));
 
         let html = `<h2 class="text-4xl font-bold mb-8 text-center">Your ${data.tables.length} Tables</h2>`;
+
+        // ANALYSIS JSON BUTTON AT VERY TOP
+        html += `<div class="text-center mb-10">
+          <button onclick="downloadAnalysisJSON()" class="bg-blue-600 hover:bg-blue-700 px-12 py-5 rounded-2xl font-semibold text-xl">📥 Download Full Analysis Data (JSON)</button>
+        </div>`;
 
         data.tables.forEach(table => {
           const blob = new Blob([table.csv], { type: 'text/csv' });
           const url = URL.createObjectURL(blob);
           html += `
             <div class="bg-zinc-900 rounded-3xl p-8 mb-10">
-              <div class="flex justify-between mb-6">
+              <div class="flex justify-between items-center mb-6">
                 <p class="text-2xl">Table ${table.table_id} — Page ${table.page_numbers}</p>
-                <a href="${url}" download="table-${table.table_id}.csv" 
-                   class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">Download CSV</a>
+                <a href="${url}" download="table-${table.table_id}.csv" class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">Download CSV</a>
               </div>
             </div>`;
         });
@@ -143,6 +146,16 @@ async def home():
       } finally {
         document.getElementById('loading').classList.add('hidden');
       }
+    }
+
+    function downloadAnalysisJSON() {
+      if (!fullData) return;
+      const blob = new Blob([JSON.stringify(fullData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'full_analysis_data.json';
+      a.click();
     }
   </script>
 </body>
@@ -199,21 +212,14 @@ async def upload(file: UploadFile = File(...)):
 @app.get("/download-all")
 async def download_all():
     global last_tables
-    if not last_tables or len(last_tables) == 0:
-        return JSONResponse({"message": "No tables to download. Upload a PDF first."})
-
+    if not last_tables:
+        return JSONResponse({"message": "No tables yet."})
     zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for table in last_tables:
-            filename = f"Table_{table['table_id']}_Page_{table['page_numbers'][0]}.csv"
-            zip_file.writestr(filename, table["csv"])
-
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        for t in last_tables:
+            z.writestr(f"Table_{t['table_id']}_Page_{t['page_numbers'][0]}.csv", t["csv"])
     zip_buffer.seek(0)
-    return StreamingResponse(
-        zip_buffer,
-        media_type="application/zip",
-        headers={"Content-Disposition": "attachment; filename=all_tables.zip"}
-    )
+    return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": "attachment; filename=all_tables.zip"})
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
