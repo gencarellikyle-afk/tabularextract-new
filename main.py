@@ -101,21 +101,20 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
         df.columns = final_cols
         return df
 
-    def ocr_fallback(self, pdf_path: str, page_num: int) -> pd.DataFrame:
-        """Primary extraction path for bad tables — aggressive OCR with robust parsing."""
+    def ocr_primary_extraction(self, pdf_path: str, page_num: int) -> pd.DataFrame:
+        """Radical primary extraction: OCR as default for all tables with robust parsing."""
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 page = pdf.pages[page_num - 1]
                 im = page.to_image(resolution=400).original
-                text = pytesseract.image_to_string(im)
+                text = pytesseract.image_to_string(im, config='--psm 6')
                 lines = [line.strip() for line in text.split('\n') if line.strip()]
                 if not lines:
                     return pd.DataFrame()
-                # Better table reconstruction from OCR
                 data = []
                 for line in lines:
                     if re.search(r'\d', line) or len(line.split()) > 1:
-                        data.append(line.split())
+                        data.append(re.split(r'\s{2,}', line.strip()))
                 if data:
                     max_cols = max(len(row) for row in data)
                     data = [row + [''] * (max_cols - len(row)) for row in data]
@@ -135,16 +134,6 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
             pass
         return "\n\n".join(context).strip()
 
-    def _needs_rescue(self, df: pd.DataFrame, confidence: float) -> bool:
-        if confidence < 0.92 or df.empty or len(df.columns) == 0:
-            return True
-        cols = [str(c).strip().lower() for c in df.columns]
-        if any(c.startswith('column_') or '(th)' in c or '(td)' in c or c in ['', 'unnamed', '.1', '.2'] for c in cols):
-            return True
-        if len(cols) > 0 and (cols[0].replace(',', '').replace('.', '').isdigit() or any(x.isdigit() for x in cols[0].split())):
-            return True
-        return False
-
     def extract_tables(self, pdf_bytes: bytes) -> Dict[str, Any]:
         tables_list = []
         tmp_path = None
@@ -153,108 +142,89 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                 tmp.write(pdf_bytes)
                 tmp_path = tmp.name
 
-            tables_raw = []
-            try:
-                tables_raw = camelot.read_pdf(tmp_path, flavor="lattice", line_scale=45, pages='all')
-            except:
-                pass
-            if not tables_raw:
-                try:
-                    tables_raw = camelot.read_pdf(tmp_path, flavor="stream", pages='all')
-                except:
-                    pass
-            if not tables_raw:
-                with pdfplumber.open(tmp_path) as pdf:
-                    for page in pdf.pages:
-                        table = page.extract_table()
-                        if table:
-                            tables_raw.append(type('obj', (object,), {'df': pd.DataFrame(table), 'page': page.page_number})())
+            with pdfplumber.open(tmp_path) as pdf:
+                for page_idx in range(len(pdf.pages)):
+                    page_num = page_idx + 1
+                    
+                    # Radical new architecture: OCR as PRIMARY extraction for EVERY table
+                    df = self.ocr_primary_extraction(tmp_path, page_num)
+                    if df.empty:
+                        # Only fall back to camelot if OCR completely fails
+                        try:
+                            tables_raw = camelot.read_pdf(tmp_path, flavor="lattice", line_scale=45, pages=str(page_num))
+                            if tables_raw:
+                                df = tables_raw[0].df
+                        except:
+                            pass
+                    if df.empty:
+                        continue
 
-            for idx, t in enumerate(tables_raw):
-                df = getattr(t, 'df', None)
-                if df is None:
-                    try:
-                        df = pd.DataFrame(t)
-                    except Exception:
-                        df = pd.DataFrame()
-                if df.empty:
-                    continue
+                    raw_csv = df.to_csv(index=False)
+                    page_text = self._get_full_page_context(tmp_path, [page_num])
 
-                page_num = getattr(t, 'page', 1)
-                raw_csv = df.to_csv(index=False)
-                page_text = self._get_full_page_context(tmp_path, [page_num])
-
-                # Aggressive OCR as primary path for bad tables
-                bad_header_ratio = sum(1 for c in df.columns if any(p in str(c).lower() for p in ['column_', 'th', 'td', '.1', '.2', ''])) / max(1, len(df.columns))
-                if bad_header_ratio > 0.2 or len(df) < 4 or page_num == 1:
-                    ocr_df = self.ocr_fallback(tmp_path, page_num)
-                    if not ocr_df.empty:
-                        df = ocr_df
-                        print(f"DEBUG: OCR fallback activated for table {idx+1} on page {page_num}")
-
-                # Stage 1
-                resp = self.client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=4000,
-                    temperature=0.0,
-                    system=self.PERFECTION_PROMPT,
-                    messages=[{"role": "user", "content": f"Raw table:\n{raw_csv}"}]
-                )
-                cleaned = self.extract_json_safe(resp.content[0].text)
-                
-                csv_str = self.csv_repair(cleaned.get("csv", raw_csv))
-                if csv_str and csv_str.strip():
-                    try:
-                        df_clean = pd.read_csv(BytesIO(csv_str.encode()))
-                    except Exception:
-                        df_clean = df
-                else:
-                    df_clean = df
-                
-                df_clean = self.final_polish(df_clean)
-                df_clean = self.handle_merged_cells(df_clean)
-                df_clean = self.local_header_repair(df_clean, page_text)
-
-                confidence = cleaned.get("confidence", 0.85)
-
-                # Stage 2 Rescue
-                if self._needs_rescue(df_clean, confidence):
-                    rescue_input = f"Full page text:\n{page_text}\n\nRaw table:\n{raw_csv}"
-                    rescue_resp = self.client.messages.create(
+                    # Stage 1
+                    resp = self.client.messages.create(
                         model="claude-sonnet-4-6",
                         max_tokens=4000,
                         temperature=0.0,
-                        system=self.RESCUE_PROMPT,
-                        messages=[{"role": "user", "content": rescue_input}]
+                        system=self.PERFECTION_PROMPT,
+                        messages=[{"role": "user", "content": f"Raw table:\n{raw_csv}"}]
                     )
-                    cleaned = self.extract_json_safe(rescue_resp.content[0].text)
+                    cleaned = self.extract_json_safe(resp.content[0].text)
                     
-                    csv_str = self.csv_repair(cleaned.get("csv", ""))
+                    csv_str = self.csv_repair(cleaned.get("csv", raw_csv))
                     if csv_str and csv_str.strip():
                         try:
                             df_clean = pd.read_csv(BytesIO(csv_str.encode()))
                         except Exception:
-                            pass
+                            df_clean = df
+                    else:
+                        df_clean = df
+                    
                     df_clean = self.final_polish(df_clean)
                     df_clean = self.handle_merged_cells(df_clean)
                     df_clean = self.local_header_repair(df_clean, page_text)
 
-                # Final guardrail
-                df_clean = self.final_polish(df_clean)
-                df_clean = self.local_header_repair(df_clean, page_text)
+                    confidence = cleaned.get("confidence", 0.85)
 
-                tables_list.append({
-                    "table_id": idx + 1,
-                    "csv": df_clean.to_csv(index=False),
-                    "json": df_clean.to_dict("records"),
-                    "confidence": cleaned.get("confidence", 0.92),
-                    "page_numbers": [page_num]
-                })
+                    # Stage 2 Rescue (only if still bad)
+                    if self._needs_rescue(df_clean, confidence):
+                        rescue_input = f"Full page text:\n{page_text}\n\nRaw table:\n{raw_csv}"
+                        rescue_resp = self.client.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=4000,
+                            temperature=0.0,
+                            system=self.RESCUE_PROMPT,
+                            messages=[{"role": "user", "content": rescue_input}]
+                        )
+                        cleaned = self.extract_json_safe(rescue_resp.content[0].text)
+                        
+                        csv_str = self.csv_repair(cleaned.get("csv", ""))
+                        if csv_str and csv_str.strip():
+                            try:
+                                df_clean = pd.read_csv(BytesIO(csv_str.encode()))
+                            except Exception:
+                                pass
+                        df_clean = self.final_polish(df_clean)
+                        df_clean = self.handle_merged_cells(df_clean)
+                        df_clean = self.local_header_repair(df_clean, page_text)
+
+                    # Final guardrail
+                    df_clean = self.final_polish(df_clean)
+                    df_clean = self.local_header_repair(df_clean, page_text)
+
+                    tables_list.append({
+                        "table_id": len(tables_list) + 1,
+                        "csv": df_clean.to_csv(index=False),
+                        "json": df_clean.to_dict("records"),
+                        "confidence": cleaned.get("confidence", 0.92),
+                        "page_numbers": [page_num]
+                    })
 
             return {
                 "success": True,
                 "tables": tables_list,
-                "message": "Universal extraction complete (aggressive OCR primary + deterministic guardrails)"
+                "message": "Universal extraction complete (OCR primary pipeline + deterministic guardrails)"
             }
         finally:
             if tmp_path and os.path.exists(tmp_path):
