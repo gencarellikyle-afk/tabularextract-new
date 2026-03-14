@@ -79,7 +79,6 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
         return csv_str
 
     def local_header_repair(self, df: pd.DataFrame, page_text: str) -> pd.DataFrame:
-        """Major upgrade: uses first real printed line from page text and removes duplicates/empty columns."""
         if df.empty or not page_text:
             return df
         cols = [str(c).strip() for c in df.columns]
@@ -92,7 +91,6 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                     if match and len(match.group(1).strip()) > 3 and not any(p in match.group(1).lower() for p in bad_patterns):
                         cols[i] = match.group(1).strip()
                         break
-        # Anti-duplication + remove empty columns
         seen = {}
         final_cols = []
         for col in cols:
@@ -104,18 +102,24 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
         return df
 
     def ocr_fallback(self, pdf_path: str, page_num: int) -> pd.DataFrame:
-        """Aggressive OCR fallback — now the primary path for any bad table."""
+        """Primary extraction path for bad tables — aggressive OCR with robust parsing."""
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 page = pdf.pages[page_num - 1]
-                im = page.to_image(resolution=300).original
+                im = page.to_image(resolution=400).original
                 text = pytesseract.image_to_string(im)
-                lines = [line.strip() for line in text.split('\n') if line.strip() and len(line.split()) > 1]
-                if lines:
-                    header = lines[0].split()
-                    data = [line.split() for line in lines[1:]]
-                    if data:
-                        return pd.DataFrame(data, columns=header[:len(data[0])])
+                lines = [line.strip() for line in text.split('\n') if line.strip()]
+                if not lines:
+                    return pd.DataFrame()
+                # Better table reconstruction from OCR
+                data = []
+                for line in lines:
+                    if re.search(r'\d', line) or len(line.split()) > 1:
+                        data.append(line.split())
+                if data:
+                    max_cols = max(len(row) for row in data)
+                    data = [row + [''] * (max_cols - len(row)) for row in data]
+                    return pd.DataFrame(data[1:], columns=data[0])
         except:
             pass
         return pd.DataFrame()
@@ -180,12 +184,13 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                 raw_csv = df.to_csv(index=False)
                 page_text = self._get_full_page_context(tmp_path, [page_num])
 
-                # Aggressive OCR fallback for bad tables
-                if len(df.columns) == 0 or sum(1 for c in df.columns if any(p in str(c).lower() for p in ['column_', 'th', 'td', '.1', '.2', ''])) > len(df.columns) * 0.3 or len(df) < 3:
+                # Aggressive OCR as primary path for bad tables
+                bad_header_ratio = sum(1 for c in df.columns if any(p in str(c).lower() for p in ['column_', 'th', 'td', '.1', '.2', ''])) / max(1, len(df.columns))
+                if bad_header_ratio > 0.2 or len(df) < 4 or page_num == 1:
                     ocr_df = self.ocr_fallback(tmp_path, page_num)
                     if not ocr_df.empty:
                         df = ocr_df
-                        print(f"DEBUG: OCR fallback triggered for table {idx+1} on page {page_num}")
+                        print(f"DEBUG: OCR fallback activated for table {idx+1} on page {page_num}")
 
                 # Stage 1
                 resp = self.client.messages.create(
@@ -249,7 +254,7 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
             return {
                 "success": True,
                 "tables": tables_list,
-                "message": "Universal extraction complete (aggressive OCR + deterministic guardrails)"
+                "message": "Universal extraction complete (aggressive OCR primary + deterministic guardrails)"
             }
         finally:
             if tmp_path and os.path.exists(tmp_path):
