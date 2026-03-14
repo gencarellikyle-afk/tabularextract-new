@@ -101,11 +101,13 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
         df.columns = final_cols
         return df
 
-    def ocr_primary_extraction(self, pdf_path: str, page_num: int) -> pd.DataFrame:
+    def ocr_on_crop(self, pdf_path: str, page_num: int, bbox: tuple) -> pd.DataFrame:
+        """Radical targeted OCR: crop exact camelot bounding box and OCR only that region."""
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 page = pdf.pages[page_num - 1]
-                im = page.to_image(resolution=400).original
+                # Crop to bbox (camelot bbox is (x0, y0, x1, y1))
+                im = page.to_image(resolution=400).original.crop(bbox)
                 text = pytesseract.image_to_string(im, config='--psm 6')
                 lines = [line.strip() for line in text.split('\n') if line.strip()]
                 if not lines:
@@ -151,84 +153,113 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                 tmp.write(pdf_bytes)
                 tmp_path = tmp.name
 
-            with pdfplumber.open(tmp_path) as pdf:
-                for page_idx in range(len(pdf.pages)):
-                    page_num = page_idx + 1
-                    
-                    df = self.ocr_primary_extraction(tmp_path, page_num)
-                    if df.empty:
-                        try:
-                            tables_raw = camelot.read_pdf(tmp_path, flavor="lattice", line_scale=45, pages=str(page_num))
-                            if tables_raw:
-                                df = tables_raw[0].df
-                        except:
-                            pass
-                    if df.empty:
-                        continue
+            tables_raw = []
+            try:
+                tables_raw = camelot.read_pdf(tmp_path, flavor="lattice", line_scale=45, pages='all')
+            except:
+                pass
+            if not tables_raw:
+                try:
+                    tables_raw = camelot.read_pdf(tmp_path, flavor="stream", pages='all')
+                except:
+                    pass
+            if not tables_raw:
+                with pdfplumber.open(tmp_path) as pdf:
+                    for page in pdf.pages:
+                        table = page.extract_table()
+                        if table:
+                            tables_raw.append(type('obj', (object,), {'df': pd.DataFrame(table), 'page': page.page_number})())
 
-                    raw_csv = df.to_csv(index=False)
-                    page_text = self._get_full_page_context(tmp_path, [page_num])
+            for idx, t in enumerate(tables_raw):
+                df = getattr(t, 'df', None)
+                if df is None:
+                    try:
+                        df = pd.DataFrame(t)
+                    except Exception:
+                        df = pd.DataFrame()
+                if df.empty:
+                    continue
 
-                    resp = self.client.messages.create(
+                page_num = getattr(t, 'page', 1)
+                raw_csv = df.to_csv(index=False)
+                page_text = self._get_full_page_context(tmp_path, [page_num])
+
+                # Hybrid radical architecture: camelot for boundary detection only
+                # If table has bad headers, crop the exact bbox and OCR only that region
+                bad_header_ratio = sum(1 for c in df.columns if any(p in str(c).lower() for p in ['column_', 'th', 'td', '.1', '.2', ''])) / max(1, len(df.columns))
+                if bad_header_ratio > 0.2 or len(df) < 4 or page_num == 1:
+                    # Use camelot bbox for precise crop (camelot tables have .bounding_box)
+                    bbox = getattr(t, 'bounding_box', None)
+                    if bbox:
+                        # bbox is (x0, y0, x1, y1) in points — convert to pixels
+                        ocr_df = self.ocr_on_crop(tmp_path, page_num, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])))
+                        if not ocr_df.empty:
+                            df = ocr_df
+                            print(f"DEBUG: Targeted OCR crop activated for table {idx+1} on page {page_num}")
+
+                # Stage 1
+                resp = self.client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=4000,
+                    temperature=0.0,
+                    system=self.PERFECTION_PROMPT,
+                    messages=[{"role": "user", "content": f"Raw table:\n{raw_csv}"}]
+                )
+                cleaned = self.extract_json_safe(resp.content[0].text)
+                
+                csv_str = self.csv_repair(cleaned.get("csv", raw_csv))
+                if csv_str and csv_str.strip():
+                    try:
+                        df_clean = pd.read_csv(BytesIO(csv_str.encode()))
+                    except Exception:
+                        df_clean = df
+                else:
+                    df_clean = df
+                
+                df_clean = self.final_polish(df_clean)
+                df_clean = self.handle_merged_cells(df_clean)
+                df_clean = self.local_header_repair(df_clean, page_text)
+
+                confidence = cleaned.get("confidence", 0.85)
+
+                # Stage 2 Rescue
+                if self._needs_rescue(df_clean, confidence):
+                    rescue_input = f"Full page text:\n{page_text}\n\nRaw table:\n{raw_csv}"
+                    rescue_resp = self.client.messages.create(
                         model="claude-sonnet-4-6",
                         max_tokens=4000,
                         temperature=0.0,
-                        system=self.PERFECTION_PROMPT,
-                        messages=[{"role": "user", "content": f"Raw table:\n{raw_csv}"}]
+                        system=self.RESCUE_PROMPT,
+                        messages=[{"role": "user", "content": rescue_input}]
                     )
-                    cleaned = self.extract_json_safe(resp.content[0].text)
+                    cleaned = self.extract_json_safe(rescue_resp.content[0].text)
                     
-                    csv_str = self.csv_repair(cleaned.get("csv", raw_csv))
+                    csv_str = self.csv_repair(cleaned.get("csv", ""))
                     if csv_str and csv_str.strip():
                         try:
                             df_clean = pd.read_csv(BytesIO(csv_str.encode()))
                         except Exception:
-                            df_clean = df
-                    else:
-                        df_clean = df
-                    
+                            pass
                     df_clean = self.final_polish(df_clean)
                     df_clean = self.handle_merged_cells(df_clean)
                     df_clean = self.local_header_repair(df_clean, page_text)
 
-                    confidence = cleaned.get("confidence", 0.85)
+                # Final guardrail
+                df_clean = self.final_polish(df_clean)
+                df_clean = self.local_header_repair(df_clean, page_text)
 
-                    if self._needs_rescue(df_clean, confidence):
-                        rescue_input = f"Full page text:\n{page_text}\n\nRaw table:\n{raw_csv}"
-                        rescue_resp = self.client.messages.create(
-                            model="claude-sonnet-4-6",
-                            max_tokens=4000,
-                            temperature=0.0,
-                            system=self.RESCUE_PROMPT,
-                            messages=[{"role": "user", "content": rescue_input}]
-                        )
-                        cleaned = self.extract_json_safe(rescue_resp.content[0].text)
-                        
-                        csv_str = self.csv_repair(cleaned.get("csv", ""))
-                        if csv_str and csv_str.strip():
-                            try:
-                                df_clean = pd.read_csv(BytesIO(csv_str.encode()))
-                            except Exception:
-                                pass
-                        df_clean = self.final_polish(df_clean)
-                        df_clean = self.handle_merged_cells(df_clean)
-                        df_clean = self.local_header_repair(df_clean, page_text)
-
-                    df_clean = self.final_polish(df_clean)
-                    df_clean = self.local_header_repair(df_clean, page_text)
-
-                    tables_list.append({
-                        "table_id": len(tables_list) + 1,
-                        "csv": df_clean.to_csv(index=False),
-                        "json": df_clean.to_dict("records"),
-                        "confidence": cleaned.get("confidence", 0.92),
-                        "page_numbers": [page_num]
-                    })
+                tables_list.append({
+                    "table_id": idx + 1,
+                    "csv": df_clean.to_csv(index=False),
+                    "json": df_clean.to_dict("records"),
+                    "confidence": cleaned.get("confidence", 0.92),
+                    "page_numbers": [page_num]
+                })
 
             return {
                 "success": True,
                 "tables": tables_list,
-                "message": "Universal extraction complete (OCR primary pipeline + deterministic guardrails)"
+                "message": "Universal extraction complete (hybrid camelot detection + targeted per-table OCR crop)"
             }
         finally:
             if tmp_path and os.path.exists(tmp_path):
