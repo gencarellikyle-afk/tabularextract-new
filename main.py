@@ -77,20 +77,20 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
         return csv_str
 
     def local_header_repair(self, df: pd.DataFrame, page_text: str) -> pd.DataFrame:
-        """Precise deterministic repair — only fixes truly bad headers using first real printed line from page."""
+        """Strongest deterministic repair — forces exact printed headers from page text and prevents duplication."""
         if df.empty or not page_text:
             return df
         cols = [str(c).strip() for c in df.columns]
-        bad = ['column_', '(th)', '(td)', '.1', '.2', '']
+        bad_patterns = ['column_', '(th)', '(td)', '.1', '.2', '']
         page_lines = [line.strip() for line in page_text.split('\n') if len(line.strip()) > 3]
         for i, col in enumerate(cols):
-            if any(p in col.lower() for p in bad):
-                for line in page_lines[:10]:  # first 10 lines = most likely header area
+            if any(p in col.lower() for p in bad_patterns):
+                for line in page_lines[:15]:
                     match = re.search(r'^([A-Za-z][A-Za-z0-9\s£$%()/\-]+)', line)
-                    if match and len(match.group(1).strip()) > 3 and not any(p in match.group(1).lower() for p in bad):
+                    if match and len(match.group(1).strip()) > 3 and not any(p in match.group(1).lower() for p in bad_patterns):
                         cols[i] = match.group(1).strip()
                         break
-        # Anti-duplication: if two identical headers appear, keep only the first
+        # Anti-duplication: collapse identical headers
         seen = {}
         for i, col in enumerate(cols):
             if col in seen:
