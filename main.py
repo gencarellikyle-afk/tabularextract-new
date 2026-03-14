@@ -77,19 +77,19 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
         return csv_str
 
     def local_header_repair(self, df: pd.DataFrame, page_text: str) -> pd.DataFrame:
-        """Deterministic fix that forces exact printed headers from page context — eliminates all Column_0/TH/TD forever."""
+        """Conservative deterministic repair — only fixes truly bad headers, never duplicates or invents."""
         if df.empty or not page_text:
             return df
         cols = [str(c).strip() for c in df.columns]
+        bad_patterns = ['column_', 'th', 'td', '.1', '.2', '']
         page_lines = page_text.split('\n')
         for i, col in enumerate(cols):
-            if col.startswith('Column_') or 'TH' in col or 'TD' in col or col in ['', 'Unnamed']:
+            if any(p in col.lower() for p in bad_patterns):
                 for line in page_lines:
-                    if len(line.strip()) > 3 and any(word in line.lower() for word in ['expenditure', 'role', 'category', 'course', 'income', 'asset', 'rainfall']):
-                        possible_header = re.search(r'([A-Za-z][A-Za-z0-9\s£$%()]+)', line)
-                        if possible_header and len(possible_header.group(1).strip()) > 3:
-                            cols[i] = possible_header.group(1).strip()
-                            break
+                    match = re.search(r'([A-Za-z][A-Za-z0-9\s£$%()/\-]+)', line)
+                    if match and len(match.group(1).strip()) > 3 and not any(p in match.group(1).lower() for p in bad_patterns):
+                        cols[i] = match.group(1).strip()
+                        break
         df.columns = cols
         return df
 
