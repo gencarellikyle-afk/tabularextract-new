@@ -1,388 +1,672 @@
-from fastapi import FastAPI, UploadFile, File
+#!/usr/bin/env python3
+"""tabularextract.com — Universal PDF Table Extractor v8.0
+Raw-matrix-first: Column_N/TH/TD structurally impossible after raw_to_df()."""
+
+from __future__ import annotations
+import asyncio, base64, csv, gc, io, json, logging, os, re, sys
+import tempfile, traceback, zipfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import anthropic, numpy as np, pandas as pd, pdfplumber
+import stripe, uvicorn
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-import uvicorn
-import os
-import re
-import json
-import pandas as pd
-from io import BytesIO
-import pdfplumber
-import camelot
-from anthropic import Anthropic
-import zipfile
-import tempfile
-import pytesseract
-from PIL import Image
-from typing import Dict, List, Any
+from fastapi.staticfiles import StaticFiles
 
-app = FastAPI(title="TabularExtract")
-last_tables = None
+# ── Config ────────────────────────────────────────────────────────────────────
+log = logging.getLogger("te")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
 
-class TableExtractionEngine:
-    def __init__(self):
-        self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        
-        self.PERFECTION_PROMPT = """You are the world's #1 PDF table extraction expert. Turn this raw table into perfect Excel-ready CSV + JSON.
-STRICT RULES (NEVER break these):
-- Use ONLY the exact printed headers from the document. NEVER output Column_0, Column_, Row header (TH), Data cell (TD), .1, .2 or any placeholder.
-- NEVER combine multiple tables in one output.
-- Repeat section names in every row for hierarchy.
-- For merged cells: put full text in LEFTMOST column only.
-- Convert symbols: ☒→No, ✓→Yes.
-- Keep commas in numbers.
-- Output ONLY this JSON: {"csv": "...", "json": [...], "confidence": 0.99}"""
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+BASE_URL = os.environ.get("BASE_URL", "https://tabularextract.com")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
+MAX_CLAUDE, CLAUDE_THRESH, MAX_FILE_MB = 10, 0.65, 50
 
-        self.RESCUE_PROMPT = """You have the FULL PAGE TEXT + raw table. Reconstruct using ONLY exact printed headers visible on the page. 
-NEVER combine multiple tables. Fix duplicates, shifts, merged cells perfectly. 
-NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this JSON: {"csv": "...", "json": [...], "confidence": 0.99}"""
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
-    def handle_merged_cells(self, df: pd.DataFrame) -> pd.DataFrame:
-        if len(df.columns) < 2 or len(df) == 0:
-            return df
-        try:
-            for col_idx in range(1, len(df.columns)):
-                prev = df.iloc[:, col_idx-1].astype(str).str.strip()
-                curr = df.iloc[:, col_idx].astype(str).str.strip()
-                for row in range(len(df)):
-                    if prev.iloc[row] == curr.iloc[row] and prev.iloc[row] != "":
-                        df.iloc[row, col_idx] = ""
-        except:
-            pass
-        return df
+app = FastAPI(title="TabularExtract", version="8.0.0")
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+Path("static").mkdir(exist_ok=True)
+try:
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+except Exception:
+    pass
 
-    def extract_json_safe(self, text: str) -> Dict:
-        text = re.sub(r'[\x00-\x1F\x7F]', '', text)
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except:
-                pass
-        return {"csv": "", "json": [], "confidence": 0.0}
+# ── Placeholder detection ─────────────────────────────────────────────────────
+_PH_RE = re.compile(
+    r"^(column[_\s]?\d*|col[_\s]?\d+|field[_\s]?\d+|unnamed[_:\s]\d*"
+    r"|\d+|th\d*|td\d*|var\d+|x\d+|f\d+|_\\d+|nan|none)$",
+    re.I,
+)
 
-    def final_polish(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-        new_cols = []
-        for i, col in enumerate(df.columns):
-            col_str = str(col).strip()
-            cleaned = re.sub(r'Column header \(TH\)|Row header \(TH\)|Data cell \(TD\)|\(TH\)|\(TD\)|Unnamed: \d+|Column_\d+|Column \d+|\.1|\.2', '', col_str, flags=re.IGNORECASE)
-            cleaned = cleaned.strip()
-            new_cols.append(cleaned if cleaned else f"Column_{i}")
-        df.columns = new_cols
-        df = df.replace(['', 'nan', 'NaN', 'None'], '').fillna('')
-        return df
+def is_ph(v: Any) -> bool:
+    s = str(v).strip() if v is not None else ""
+    return not s or s in {"-", "–", "—", "n/a"} or bool(_PH_RE.match(s))
 
-    def csv_repair(self, csv_str: str) -> str:
-        csv_str = re.sub(r'"(\d+),(\d+)"', r'\1\2', csv_str)
-        csv_str = re.sub(r'""(\d+),(\d+)""', r'"\1\2"', csv_str)
-        return csv_str
+def all_ph(names: List[Any]) -> bool:
+    return bool(names) and all(is_ph(n) for n in names)
 
-    def local_header_repair(self, df: pd.DataFrame, page_text: str) -> pd.DataFrame:
-        if df.empty or not page_text:
-            return df
-        cols = [str(c).strip() for c in df.columns]
-        bad_patterns = ['column_', '(th)', '(td)', '.1', '.2', '']
-        page_lines = [line.strip() for line in page_text.split('\n') if len(line.strip()) > 3]
-        for i, col in enumerate(cols):
-            if any(p in col.lower() for p in bad_patterns):
-                for line in page_lines[:20]:
-                    match = re.search(r'^([A-Za-z][A-Za-z0-9\s£$%()/\-]+)', line)
-                    if match and len(match.group(1).strip()) > 3 and not any(p in match.group(1).lower() for p in bad_patterns):
-                        cols[i] = match.group(1).strip()
-                        break
-        seen = {}
-        final_cols = []
-        for col in cols:
-            if col and col not in seen:
-                seen[col] = True
-                final_cols.append(col)
-        df = df.iloc[:, :len(final_cols)]
-        df.columns = final_cols
-        return df
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE: raw_to_df — THE SINGLE CHOKEPOINT
+# ══════════════════════════════════════════════════════════════════════════════
+def _c(v: Any) -> str:
+    s = "" if v is None else str(v).strip()
+    return "" if s.lower() in {"none", "nan"} else s
 
-    def ocr_on_crop(self, pdf_path: str, page_num: int, bbox: tuple) -> pd.DataFrame:
-        """Radical targeted OCR: crop exact camelot bounding box and OCR only that region for perfect headers."""
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                page = pdf.pages[page_num - 1]
-                im = page.to_image(resolution=400).original.crop((int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])))
-                text = pytesseract.image_to_string(im, config='--psm 6')
-                lines = [line.strip() for line in text.split('\n') if line.strip()]
-                if not lines:
-                    return pd.DataFrame()
-                data = []
-                for line in lines:
-                    if re.search(r'\d', line) or len(line.split()) > 1:
-                        data.append(re.split(r'\s{2,}', line.strip()))
-                if data:
-                    max_cols = max(len(row) for row in data)
-                    data = [row + [''] * (max_cols - len(row)) for row in data]
-                    return pd.DataFrame(data[1:], columns=data[0])
-        except:
-            pass
-        return pd.DataFrame()
+def _norm(raw: List[List[Any]]) -> List[List[str]]:
+    if not raw:
+        return []
+    nc = max(len(r) for r in raw)
+    return [[_c(r[i]) if i < len(r) else "" for i in range(nc)] for r in raw]
 
-    def _get_full_page_context(self, pdf_path: str, page_numbers: List[int]) -> str:
-        context = []
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for p_num in page_numbers:
-                    if 0 <= p_num - 1 < len(pdf.pages):
-                        context.append(pdf.pages[p_num - 1].extract_text() or "")
-        except:
-            pass
-        return "\n\n".join(context).strip()
+def _dedup_names(names: List[str]) -> List[str]:
+    seen: Dict[str, int] = {}
+    out = []
+    for n in names:
+        n = re.sub(r"[\n\r\t|]+", " ", n).strip()
+        n = re.sub(r"\s{2,}", " ", n) or "Col"
+        if n in seen:
+            seen[n] += 1
+            out.append(f"{n}_{seen[n]}")
+        else:
+            seen[n] = 1
+            out.append(n)
+    return out
 
-    def _needs_rescue(self, df: pd.DataFrame, confidence: float) -> bool:
-        if confidence < 0.92 or df.empty or len(df.columns) == 0:
-            return True
-        cols = [str(c).strip().lower() for c in df.columns]
-        if any(c.startswith('column_') or '(th)' in c or '(td)' in c or c in ['', 'unnamed', '.1', '.2'] for c in cols):
-            return True
-        if len(cols) > 0 and (cols[0].replace(',', '').replace('.', '').isdigit() or any(x.isdigit() for x in cols[0].split())):
-            return True
+def _make_header(row: List[str]) -> List[str]:
+    return _dedup_names(
+        [v if v and not is_ph(v) else f"Col_{i}" for i, v in enumerate(row)]
+    )
+
+def _row_is_header(row: List[str]) -> bool:
+    vals = [v for v in row if v]
+    if len(vals) < 2:
         return False
+    num = sum(1 for v in vals if re.match(r"^-?[\d,.\s]+%?$", v))
+    if num / len(vals) > 0.35:
+        return False
+    if any(len(v) > 80 for v in vals):
+        return False
+    return sum(1 for v in vals if re.search(r"[a-zA-Z]{2,}", v)) >= 1
 
-    def extract_tables(self, pdf_bytes: bytes) -> Dict[str, Any]:
-        tables_list = []
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(pdf_bytes)
-                tmp_path = tmp.name
+def _split_on_empty(rows: List[List[str]]) -> List[List[List[str]]]:
+    blocks, cur = [], []
+    for row in rows:
+        if all(not v for v in row):
+            if cur:
+                blocks.append(cur)
+                cur = []
+        else:
+            cur.append(row)
+    if cur:
+        blocks.append(cur)
+    return [b for b in blocks if len(b) >= 2]
 
-            tables_raw = []
-            try:
-                tables_raw = camelot.read_pdf(tmp_path, flavor="lattice", line_scale=45, pages='all')
-            except:
-                pass
-            if not tables_raw:
-                try:
-                    tables_raw = camelot.read_pdf(tmp_path, flavor="stream", pages='all')
-                except:
-                    pass
-            if not tables_raw:
-                with pdfplumber.open(tmp_path) as pdf:
-                    for page in pdf.pages:
-                        table = page.extract_table()
-                        if table:
-                            tables_raw.append(type('obj', (object,), {'df': pd.DataFrame(table), 'page': page.page_number})())
+def _split_col_jump(rows: List[List[str]]) -> List[List[List[str]]]:
+    if len(rows) < 4:
+        return [rows]
+    ne = [sum(1 for v in r if v) for r in rows]
+    avg = sum(ne) / len(ne)
+    for i in range(2, len(rows) - 1):
+        a = sum(ne[:i]) / i
+        b = sum(ne[i:]) / (len(rows) - i)
+        if abs(a - b) > max(avg * 0.4, 1.5):
+            return [rows[:i], rows[i:]]
+    return [rows]
 
-            for idx, t in enumerate(tables_raw):
-                df = getattr(t, 'df', None)
-                if df is None:
-                    try:
-                        df = pd.DataFrame(t)
-                    except Exception:
-                        df = pd.DataFrame()
-                if df.empty:
-                    continue
+def _promote(block: List[List[str]]) -> Tuple[List[str], List[List[str]]]:
+    if not block:
+        return [], []
+    if _row_is_header(block[0]):
+        return _make_header(block[0]), block[1:]
+    if len(block) >= 2 and sum(1 for v in block[0] if not v) > len(block[0]) * 0.5:
+        if _row_is_header(block[1]):
+            return _make_header(block[1]), block[2:]
+    candidate = [v if v else f"Col_{i}" for i, v in enumerate(block[0])]
+    if all_ph(candidate):
+        return _make_header(block[0]), block[1:]
+    real = [v for v in block[0] if v and not is_ph(v)]
+    if len(real) >= max(2, len(block[0]) // 2):
+        return _make_header(block[0]), block[1:]
+    return _make_header(block[0]), block[1:]
 
-                page_num = getattr(t, 'page', 1)
-                raw_csv = df.to_csv(index=False)
-                page_text = self._get_full_page_context(tmp_path, [page_num])
+def raw_to_df(raw: List[List[Any]]) -> List[pd.DataFrame]:
+    m = _norm(raw)
+    if not m:
+        return []
+    results = []
+    for block in (_split_on_empty(m) or [m]):
+        for sub in (_split_col_jump(block) or [block]):
+            if len(sub) < 2:
+                continue
+            header, data = _promote(sub)
+            if not header or not data:
+                continue
+            data = [r for r in data if r != header]
+            df = pd.DataFrame(data, columns=header)
+            df.replace("", np.nan, inplace=True)
+            df.dropna(how="all", inplace=True)
+            df.dropna(axis=1, how="all", inplace=True)
+            df.fillna("", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            if not df.empty and len(df.columns) >= 2:
+                results.append(df)
+    return results
 
-                # Hybrid architecture: camelot for boundary detection only
-                # If table has bad headers, crop the exact bbox and OCR only that region
-                bad_header_ratio = sum(1 for c in df.columns if any(p in str(c).lower() for p in ['column_', 'th', 'td', '.1', '.2', ''])) / max(1, len(df.columns))
-                if bad_header_ratio > 0.2 or len(df) < 4 or page_num == 1:
-                    bbox = getattr(t, 'bbox', None)
-                    if bbox:
-                        ocr_df = self.ocr_on_crop(tmp_path, page_num, bbox)
-                        if not ocr_df.empty:
-                            df = ocr_df
-                            print(f"DEBUG: Targeted OCR crop activated for table {idx+1} on page {page_num}")
+# ── Light post-DataFrame polish ───────────────────────────────────────────────
+def _clean_col_names(df: pd.DataFrame) -> pd.DataFrame:
+    new = []
+    for i, c in enumerate(df.columns):
+        s = re.sub(r"[\n\r\t|]+", " ", str(c)).strip()
+        s = re.sub(r"\s{2,}", " ", s)
+        new.append(s if s and not is_ph(s) else f"Col_{i}")
+    df.columns = _dedup_names(new)
+    return df
 
-                # Stage 1
-                resp = self.client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=4000,
-                    temperature=0.0,
-                    system=self.PERFECTION_PROMPT,
-                    messages=[{"role": "user", "content": f"Raw table:\n{raw_csv}"}]
-                )
-                cleaned = self.extract_json_safe(resp.content[0].text)
-                
-                csv_str = self.csv_repair(cleaned.get("csv", raw_csv))
-                if csv_str and csv_str.strip():
-                    try:
-                        df_clean = pd.read_csv(BytesIO(csv_str.encode()))
-                    except Exception:
-                        df_clean = df
+def _ffill_labels(df: pd.DataFrame) -> pd.DataFrame:
+    for col in df.columns:
+        s = df[col].astype(str).str.strip()
+        non_e = s[~s.isin(["", "nan", "None"])]
+        if len(non_e) == 0:
+            continue
+        if non_e.apply(lambda v: bool(re.match(r"^-?[\d,.\s]+%?$", v))).mean() < 0.5:
+            last, filled = None, []
+            for v in s:
+                if v in ("", "nan", "None", "-", "–"):
+                    filled.append(last or v)
                 else:
-                    df_clean = df
-                
-                df_clean = self.final_polish(df_clean)
-                df_clean = self.handle_merged_cells(df_clean)
-                df_clean = self.local_header_repair(df_clean, page_text)
+                    last = v
+                    filled.append(v)
+            df[col] = filled
+    return df
 
-                confidence = cleaned.get("confidence", 0.85)
+def clean(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if df is None or df.empty:
+        return None
+    if all_ph(list(df.columns)):
+        results = raw_to_df([list(df.columns)] + df.values.tolist())
+        if results:
+            df = results[0]
+    df = _clean_col_names(df)
+    df.replace("", np.nan, inplace=True)
+    df.dropna(how="all", inplace=True)
+    df.dropna(axis=1, how="all", inplace=True)
+    df.fillna("", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df = _ffill_labels(df)
+    return df if (not df.empty and len(df.columns) >= 2) else None
 
-                # Stage 2 Rescue
-                if self._needs_rescue(df_clean, confidence):
-                    rescue_input = f"Full page text:\n{page_text}\n\nRaw table:\n{raw_csv}"
-                    rescue_resp = self.client.messages.create(
-                        model="claude-sonnet-4-6",
-                        max_tokens=4000,
-                        temperature=0.0,
-                        system=self.RESCUE_PROMPT,
-                        messages=[{"role": "user", "content": rescue_input}]
-                    )
-                    cleaned = self.extract_json_safe(rescue_resp.content[0].text)
-                    
-                    csv_str = self.csv_repair(cleaned.get("csv", ""))
-                    if csv_str and csv_str.strip():
-                        try:
-                            df_clean = pd.read_csv(BytesIO(csv_str.encode()))
-                        except Exception:
-                            pass
-                    df_clean = self.final_polish(df_clean)
-                    df_clean = self.handle_merged_cells(df_clean)
-                    df_clean = self.local_header_repair(df_clean, page_text)
+# ── Confidence score ──────────────────────────────────────────────────────────
+def score(df: pd.DataFrame) -> float:
+    if df is None or df.empty:
+        return 0.0
+    cols, nr = list(df.columns), len(df)
+    nc = len(cols)
+    good_h = sum(1 for c in cols if not is_ph(c) and len(str(c).strip()) > 1)
+    col_l = [str(c).strip().lower() for c in cols]
+    dup = df.apply(lambda r: [str(v).strip().lower() for v in r] == col_l, axis=1).any()
+    ne_c = df.apply(lambda r: sum(1 for v in r if str(v).strip() not in ("", "nan")), axis=1)
+    consistency = max(0, 1 - ne_c.std() / max(ne_c.mean(), 1)) if nr > 1 else 1.0
+    fill = sum(1 for v in df.values.flatten() if str(v).strip() not in ("", "nan")) / max(df.size, 1)
+    valid_n = sum(1 for c in cols if len(str(c).strip()) > 1 and not re.match(r"^\d+$", str(c).strip()))
+    return round(min(0.30 * (good_h / max(nc, 1)) + 0.15 * (0 if dup else 1) + 0.15 * consistency + 0.15 * fill + 0.10 * (1 if nc >= 2 and nr >= 1 else 0) + 0.15 * (valid_n / max(nc, 1)), 1.0), 4)
 
-                # Final guardrail
-                df_clean = self.final_polish(df_clean)
-                df_clean = self.local_header_repair(df_clean, page_text)
+# ── pdfplumber extraction ─────────────────────────────────────────────────────
+_SL = dict(vertical_strategy="lines", horizontal_strategy="lines", snap_tolerance=3, join_tolerance=3, edge_min_length=10, min_words_vertical=1, min_words_horizontal=1, intersection_tolerance=3, text_tolerance=3)
+_SM = dict(vertical_strategy="lines", horizontal_strategy="text", snap_tolerance=4, join_tolerance=4, edge_min_length=8, min_words_vertical=1, min_words_horizontal=1, intersection_tolerance=4, text_x_tolerance=4, text_y_tolerance=4)
+_ST = dict(vertical_strategy="text", horizontal_strategy="text", snap_tolerance=5, join_tolerance=5, edge_min_length=5, min_words_vertical=1, min_words_horizontal=1, intersection_tolerance=5, text_x_tolerance=5, text_y_tolerance=5)
 
-                tables_list.append({
-                    "table_id": idx + 1,
-                    "csv": df_clean.to_csv(index=False),
-                    "json": df_clean.to_dict("records"),
-                    "confidence": cleaned.get("confidence", 0.92),
-                    "page_numbers": [page_num]
-                })
+def _bbox_overlap(a: Tuple, b: Tuple) -> float:
+    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    return (ix1 - ix0) * (iy1 - iy0) / max((a[2] - a[0]) * (a[3] - a[1]), 1)
 
-            return {
-                "success": True,
-                "tables": tables_list,
-                "message": "Universal extraction complete (hybrid camelot detection + targeted per-table OCR crop)"
-            }
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+def _plumber_page(page: Any, pnum: int) -> List[Dict]:
+    out, used = [], []
+    for sname, settings in [("lines", _SL), ("mixed", _SM), ("text", _ST)]:
+        found = []
+        try:
+            fts = page.find_tables(settings)
+        except Exception:
+            continue
+        for ft in fts:
+            try:
+                bbox = ft.bbox
+            except Exception:
+                bbox = None
+            if bbox and any(_bbox_overlap(bbox, u) > 0.4 for u in used):
+                continue
+            try:
+                raw = ft.extract()
+            except Exception:
+                continue
+            if not raw or len(raw) < 2:
+                continue
+            for df in raw_to_df(raw):
+                df2 = clean(df)
+                if df2 is None:
+                    continue
+                found.append({"df": df2, "page_num": pnum, "bbox": bbox, "strategy": sname, "conf": score(df2)})
+            if bbox:
+                used.append(bbox)
+        out.extend(found)
+        if found and sname in ("lines", "mixed"):
+            break
+    return out
 
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>TabularExtract - Perfect Tables from Any PDF</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-zinc-950 text-white min-h-screen">
-  <div class="max-w-5xl mx-auto p-8">
-    <h1 class="text-6xl font-bold text-center mb-4">TabularExtract</h1>
-    <p class="text-2xl text-zinc-400 text-center mb-12">Upload any PDF — get perfect tables instantly</p>
-    <div id="uploadArea" class="bg-zinc-900 border-2 border-dashed border-zinc-700 rounded-3xl p-16 text-center cursor-pointer">
-      <input type="file" id="pdf" accept="application/pdf" class="hidden">
-      <div class="mx-auto w-16 h-16 mb-6 text-zinc-400">📤</div>
-      <p class="text-2xl font-semibold mb-2">Drop your PDF here</p>
-      <p class="text-zinc-400">or click to choose a file</p>
-    </div>
-    <button id="extractBtn" onclick="startExtraction()" class="mt-8 w-full bg-emerald-600 hover:bg-emerald-700 text-white px-12 py-5 rounded-2xl font-semibold text-2xl hidden">
-      Extract Tables Now
-    </button>
-    <div id="loading" class="hidden text-center mt-12">
-      <div class="animate-spin w-16 h-16 border-4 border-emerald-600 border-t-transparent rounded-full mx-auto"></div>
-      <p class="mt-6 text-xl">Extracting perfect tables...</p>
-    </div>
-    <div id="results" class="mt-12"></div>
-  </div>
-  <script>
-    let selectedFile = null;
-    let fullData = null;
-    const uploadArea = document.getElementById('uploadArea');
-    const fileInput = document.getElementById('pdf');
-    const extractBtn = document.getElementById('extractBtn');
-    uploadArea.addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', (e) => {
-      selectedFile = e.target.files[0];
-      if (selectedFile) {
-        extractBtn.classList.remove('hidden');
-        extractBtn.textContent = `Extract Tables from ${selectedFile.name}`;
-      }
-    });
-    async function startExtraction() {
-      if (!selectedFile) return;
-      uploadArea.classList.add('hidden');
-      extractBtn.classList.add('hidden');
-      document.getElementById('loading').classList.remove('hidden');
-      const formData = new FormData();
-      formData.append('file', selectedFile);
-      try {
-        const res = await fetch('/upload', { method: 'POST', body: formData });
-        const data = await res.json();
-        if (!data.success) {
-          document.getElementById('results').innerHTML = `<p class="text-red-500 text-center text-2xl">Error: ${data.error || 'Unknown error'}</p>`;
-          return;
-        }
-        fullData = data;
-        console.log("✅ FULL EXTRACTION DATA FOR QUALITY ANALYSIS:", JSON.stringify(data, null, 2));
-        let html = `<h2 class="text-4xl font-bold mb-8 text-center">Your ${data.tables.length} Tables</h2>`;
-        html += `<div class="text-center mb-10">
-          <button onclick="downloadAnalysisJSON()" class="bg-blue-600 hover:bg-blue-700 px-12 py-5 rounded-2xl font-semibold text-xl">📥 Download Full Analysis Data (JSON)</button>
-        </div>`;
-        data.tables.forEach(table => {
-          const blob = new Blob([table.csv], { type: 'text/csv' });
-          const url = URL.createObjectURL(blob);
-          html += `
-            <div class="bg-zinc-900 rounded-3xl p-8 mb-10">
-              <div class="flex justify-between items-center mb-6">
-                <p class="text-2xl">Table ${table.table_id} — Page ${table.page_numbers}</p>
-                <a href="${url}" download="table-${table.table_id}.csv" class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">Download CSV</a>
-              </div>
-            </div>`;
-        });
-        html += `<div class="text-center mt-12">
-          <a href="/download-all" class="bg-white text-black px-12 py-5 rounded-2xl font-semibold text-2xl">Download All Tables as ZIP</a>
-        </div>`;
-        document.getElementById('results').innerHTML = html;
-      } catch (e) {
-        document.getElementById('results').innerHTML = `<p class="text-red-500 text-center text-2xl">Error: ${e.message}</p>`;
-      } finally {
-        document.getElementById('loading').classList.add('hidden');
-      }
-    }
-    function downloadAnalysisJSON() {
-      if (!fullData) return;
-      const blob = new Blob([JSON.stringify(fullData, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'full_analysis_data.json';
-      a.click();
-    }
-  </script>
-</body>
-</html>
-"""
-
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    global last_tables
+def extract_plumber(pdf_path: str) -> Tuple[List[Dict], int]:
+    tables, total = [], 0
     try:
-        content = await file.read()
-        engine = TableExtractionEngine()
-        result = engine.extract_tables(content)
-        last_tables = result.get("tables", [])
-        return result
+        with pdfplumber.open(pdf_path) as pdf:
+            total = len(pdf.pages)
+            for i, page in enumerate(pdf.pages, 1):
+                try:
+                    pt = _plumber_page(page, i)
+                    tables.extend(pt)
+                    if pt:
+                        log.info("plumber p%d: %d tables", i, len(pt))
+                except Exception as e:
+                    log.warning("plumber p%d: %s", i, e)
     except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)})
+        log.error("plumber fatal: %s", e)
+    return tables, total
 
-@app.get("/download-all")
-async def download_all():
-    global last_tables
-    if not last_tables:
-        return JSONResponse({"message": "No tables yet."})
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
-        for t in last_tables:
-            z.writestr(f"Table_{t['table_id']}_Page_{t['page_numbers'][0]}.csv", t["csv"])
-    zip_buffer.seek(0)
-    return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": "attachment; filename=all_tables.zip"})
+# ── Camelot fallback ──────────────────────────────────────────────────────────
+def extract_camelot(pdf_path: str, pages: List[int]) -> List[Dict]:
+    if not pages:
+        return []
+    try:
+        import camelot as _c
+    except ImportError:
+        return []
+    ps = ",".join(str(p) for p in sorted(set(pages)))
+    out = []
+    for flavor, kw in [("lattice", {"line_scale": 45, "copy_text": ["v", "h"]}), ("stream", {"edge_tol": 500, "row_tol": 10})]:
+        try:
+            for ct in _c.read_pdf(pdf_path, pages=ps, flavor=flavor, **kw):
+                raw_df = ct.df
+                col_names = list(raw_df.columns)
+                full_raw = ([col_names] + raw_df.values.tolist()) if all_ph(col_names) else ([list(raw_df.iloc[0])] + raw_df.values.tolist()[1:])
+                for df in raw_to_df(full_raw):
+                    df2 = clean(df)
+                    if df2 is None:
+                        continue
+                    out.append({"df": df2, "page_num": int(ct.page), "bbox": None, "strategy": f"cam_{flavor}", "conf": score(df2)})
+            if out:
+                break
+        except Exception as e:
+            log.warning("camelot %s: %s", flavor, e)
+    return out
+
+# ── OCR fallback ──────────────────────────────────────────────────────────────
+def extract_ocr(pdf_path: str, pnum: int) -> List[Dict]:
+    try:
+        import pytesseract
+        with pdfplumber.open(pdf_path) as pdf:
+            img = pdf.pages[pnum - 1].to_image(resolution=200).original
+            lines = [ln for ln in pytesseract.image_to_string(img, config="--psm 6").splitlines() if ln.strip()]
+            blocks, cur, prev_nc = [], [], None
+            for ln in lines:
+                parts = re.split(r"\s{2,}", ln.strip())
+                nc = len(parts)
+                if nc >= 2:
+                    if prev_nc is None or abs(nc - prev_nc) <= 1:
+                        cur.append(parts)
+                        prev_nc = nc
+                    else:
+                        if cur:
+                            blocks.append(cur)
+                        cur = [parts]
+                        prev_nc = nc
+                else:
+                    if cur:
+                        blocks.append(cur)
+                    cur = []
+                    prev_nc = None
+            if cur:
+                blocks.append(cur)
+            out = []
+            for b in blocks:
+                if len(b) < 2:
+                    continue
+                for df in raw_to_df(b):
+                    df2 = clean(df)
+                    if df2 is None:
+                        continue
+                    out.append({"df": df2, "page_num": pnum, "bbox": None, "strategy": "ocr", "conf": score(df2)})
+            return out
+    except Exception as e:
+        log.warning("ocr p%d: %s", pnum, e)
+        return []
+
+# ── Dedup ─────────────────────────────────────────────────────────────────────
+def dedup(tables: List[Dict]) -> List[Dict]:
+    seen: Dict[str, Dict] = {}
+    for t in tables:
+        df = t["df"]
+        cols = "|".join(str(c)[:12] for c in df.columns[:5])
+        r0 = "|".join(str(v)[:8] for v in (df.iloc[0] if len(df) else []))[:40]
+        fp = f"{len(df.columns)}x{len(df)}:{cols}:{r0}"
+        if fp not in seen or t["conf"] > seen[fp]["conf"]:
+            seen[fp] = t
+    return sorted(
+        seen.values(),
+        key=lambda t: (t["page_num"], (t.get("bbox") or (0, 0, 0, 0))[1]),
+    )
+
+# ── Claude rescue ─────────────────────────────────────────────────────────────
+def _raw_words(pdf_path: str, pnum: int, bbox: Optional[Tuple]) -> str:
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            page = pdf.pages[pnum - 1]
+            region = page.within_bbox(bbox) if bbox else page
+            words = region.extract_words(x_tolerance=3, y_tolerance=3)
+            if not words:
+                return page.extract_text() or ""
+            yb: Dict[int, List] = {}
+            for w in words:
+                k = round(w["top"] / 8) * 8
+                yb.setdefault(k, []).append(w)
+            return "\n".join(
+                " ".join(w["text"] for w in sorted(yb[k], key=lambda w: w["x0"]))
+                for k in sorted(yb)
+            )[:2500]
+    except Exception:
+        return ""
+
+async def claude_rescue(t: Dict, pdf_path: str, label: str) -> pd.DataFrame:
+    if not ANTHROPIC_API_KEY:
+        return t["df"]
+    ctx = _raw_words(pdf_path, t["page_num"], t.get("bbox"))
+    if not ctx.strip():
+        return t["df"]
+    prompt = (
+        f"Extract the table from page {t['page_num']}. "
+        f"Current broken cols: {list(t['df'].columns)}\n\n"
+        f"Raw PDF text (ground truth):\n```\n{ctx}\n```\n\n"
+        "Return ONLY a CSV with real descriptive headers on row 1 "
+        "(no Column_0/TH/TD/Col_N placeholders, no markdown fences). CSV:"
+    )
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        resp = await asyncio.to_thread(
+            client.messages.create,
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        csv_txt = re.sub(r"^```[a-zA-Z]*\n?", "", resp.content[0].text.strip(), flags=re.M)
+        csv_txt = re.sub(r"\n?```\s*$", "", csv_txt, flags=re.M).strip()
+        rows = list(csv.reader(io.StringIO(csv_txt)))
+        if len(rows) < 2:
+            return t["df"]
+        dfs = raw_to_df(rows)
+        if not dfs:
+            return t["df"]
+        new_df = clean(dfs[0])
+        if new_df is None:
+            return t["df"]
+        ns, os_ = score(new_df), score(t["df"])
+        log.info("claude %s: %.2f→%.2f cols=%s", label, os_, ns, list(new_df.columns)[:4])
+        return new_df if (ns >= os_ or os_ < 0.5) else t["df"]
+    except Exception as e:
+        log.error("claude %s: %s", label, e)
+        return t["df"]
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+async def run_pipeline(pdf_path: str) -> List[Dict]:
+    tables, total_pages = extract_plumber(pdf_path)
+    covered = {t["page_num"] for t in tables}
+
+    missing = [p for p in range(1, total_pages + 1) if p not in covered]
+    if missing:
+        ct = extract_camelot(pdf_path, missing)
+        tables.extend(ct)
+        covered.update(t["page_num"] for t in ct)
+
+    for p in [pp for pp in range(1, total_pages + 1) if pp not in covered][:5]:
+        tables.extend(extract_ocr(pdf_path, p))
+
+    if not tables:
+        return []
+
+    cleaned = []
+    for t in tables:
+        df = clean(t["df"].copy())
+        if df is None:
+            continue
+        t["df"] = df
+        t["conf"] = score(df)
+        cleaned.append(t)
+
+    unique = dedup(cleaned)
+
+    low = [(i, t) for i, t in enumerate(unique) if t["conf"] < CLAUDE_THRESH][:MAX_CLAUDE]
+    if low and ANTHROPIC_API_KEY:
+        sem = asyncio.Semaphore(3)
+
+        async def _r(i, t):
+            async with sem:
+                return i, await claude_rescue(t, pdf_path, f"t{i+1}_p{t['page_num']}")
+
+        for res in await asyncio.gather(*[_r(i, t) for i, t in low], return_exceptions=True):
+            if isinstance(res, Exception):
+                continue
+            i, df = res
+            if df is not None and not df.empty:
+                unique[i]["df"] = df
+                unique[i]["conf"] = score(df)
+
+    final = []
+    for t in unique:
+        df = clean(t["df"].copy())
+        if df is None:
+            continue
+        t["df"] = df
+        t["conf"] = score(df)
+        final.append(t)
+
+    log.info("FINAL: %d tables", len(final))
+    for i, t in enumerate(final):
+        log.info(
+            " t%d p%d %s conf=%.2f cols=%s",
+            i + 1, t["page_num"], t["df"].shape, t["conf"],
+            list(t["df"].columns)[:4],
+        )
+    return final
+
+# ── Output helpers ────────────────────────────────────────────────────────────
+def to_csv(df: pd.DataFrame) -> str:
+    b = io.StringIO()
+    df.to_csv(b, index=False)
+    return b.getvalue()
+
+def to_records(df: pd.DataFrame) -> List[Dict]:
+    return df.where(pd.notnull(df), "").to_dict(orient="records")
+
+def build_response(tables: List[Dict]) -> List[Dict]:
+    return [
+        {
+            "table_id": f"table_{i+1}",
+            "csv": to_csv(t["df"]),
+            "json": to_records(t["df"]),
+            "confidence": round(t["conf"], 4),
+            "page_numbers": [t["page_num"]],
+        }
+        for i, t in enumerate(tables)
+    ]
+
+def build_zip(resp: List[Dict]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for t in resp:
+            zf.writestr(f"{t['table_id']}.csv", t["csv"])
+        zf.writestr(
+            "full_analysis_data.json",
+            json.dumps(
+                {
+                    "success": True,
+                    "total_tables": len(resp),
+                    "tables": [
+                        {
+                            "table_id": t["table_id"],
+                            "page_numbers": t["page_numbers"],
+                            "confidence": t["confidence"],
+                            "columns": list(t["json"][0].keys()) if t["json"] else [],
+                        }
+                        for t in resp
+                    ],
+                },
+                indent=2,
+            ),
+        )
+    return buf.getvalue()
+
+# ── Upload handler ────────────────────────────────────────────────────────────
+async def _handle(file: UploadFile) -> Tuple[List[Dict], bytes]:
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files supported.")
+    data = await file.read()
+    if len(data) < 100:
+        raise HTTPException(400, "File too small.")
+    if len(data) > MAX_FILE_MB * 1024 * 1024:
+        raise HTTPException(400, f"Max {MAX_FILE_MB}MB.")
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+            f.write(data)
+            tmp = f.name
+        tables = await run_pipeline(tmp)
+        resp = build_response(tables)
+        return resp, build_zip(resp)
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+        gc.collect()
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    p = Path("index.html")
+    return HTMLResponse(p.read_text() if p.exists() else "<h1>TabularExtract</h1>")
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy():
+    p = Path("privacy.html")
+    return HTMLResponse(p.read_text() if p.exists() else "<h1>Privacy</h1>")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "8.0.0"}
+
+@app.post("/extract")
+async def extract(file: UploadFile = File(...)):
+    try:
+        resp, _ = await _handle(file)
+        return JSONResponse({"success": True, "tables": resp})
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(traceback.format_exc())
+        raise HTTPException(500, str(e))
+
+@app.post("/extract-with-files")
+async def extract_with_files(file: UploadFile = File(...)):
+    try:
+        resp, zb = await _handle(file)
+        return JSONResponse({
+            "success": True,
+            "tables": resp,
+            "zip_base64": base64.b64encode(zb).decode(),
+            "total_tables": len(resp),
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(traceback.format_exc())
+        raise HTTPException(500, str(e))
+
+@app.post("/extract-zip")
+async def extract_zip(file: UploadFile = File(...)):
+    try:
+        _, zb = await _handle(file)
+        return StreamingResponse(
+            io.BytesIO(zb),
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=tables.zip"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(traceback.format_exc())
+        raise HTTPException(500, str(e))
+
+@app.post("/stripe-webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+        log.info("stripe %s", event["type"])
+        return JSONResponse({"received": True})
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/create-checkout-session")
+async def create_checkout(request: Request):
+    try:
+        data = await request.json()
+        plan = data.get("plan", "starter")
+        prices = {
+            "starter": os.environ.get("STRIPE_PRICE_STARTER", ""),
+            "pro": os.environ.get("STRIPE_PRICE_PRO", ""),
+            "enterprise": os.environ.get("STRIPE_PRICE_ENTERPRISE", ""),
+        }
+        pid = prices.get(plan, "")
+        if not pid:
+            raise HTTPException(400, f"Unknown plan: {plan}")
+        s = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{"price": pid, "quantity": 1}],
+            mode="subscription",
+            success_url=f"{BASE_URL}/success",
+            cancel_url=f"{BASE_URL}/cancel",
+        )
+        return JSONResponse({"url": s.url})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.on_event("startup")
+async def startup():
+    log.info(
+        "TabularExtract v8.0.0 | Claude=%s | Anthropic=%s",
+        CLAUDE_MODEL,
+        "SET" if ANTHROPIC_API_KEY else "NOT SET",
+    )
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        reload=False,
+        workers=1,
+    )
