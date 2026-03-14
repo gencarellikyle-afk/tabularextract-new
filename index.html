@@ -9,72 +9,104 @@
   <div class="max-w-5xl mx-auto p-8">
     <h1 class="text-6xl font-bold text-center mb-4">TabularExtract</h1>
     <p class="text-2xl text-zinc-400 text-center mb-12">Upload any PDF — get perfect tables instantly</p>
-
     <div id="uploadArea" class="bg-zinc-900 border-2 border-dashed border-zinc-700 rounded-3xl p-16 text-center cursor-pointer">
       <input type="file" id="pdf" accept="application/pdf" class="hidden">
-      <div class="mx-auto w-16 h-16 mb-6 text-zinc-400">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903 5 5 0 0110.025 1.65L12 13l-.354-.354a2 2 0 01-.293-.293L12 10" />
-        </svg>
-      </div>
+      <div class="mx-auto w-16 h-16 mb-6 text-zinc-400">📤</div>
       <p class="text-2xl font-semibold mb-2">Drop your PDF here</p>
       <p class="text-zinc-400">or click to choose a file</p>
     </div>
-
+    <button id="extractBtn" onclick="startExtraction()" class="mt-8 w-full bg-emerald-600 hover:bg-emerald-700 text-white px-12 py-5 rounded-2xl font-semibold text-2xl hidden">
+      Extract Tables Now
+    </button>
     <div id="loading" class="hidden text-center mt-12">
       <div class="animate-spin w-16 h-16 border-4 border-emerald-600 border-t-transparent rounded-full mx-auto"></div>
       <p class="mt-6 text-xl">Extracting perfect tables...</p>
     </div>
-
     <div id="results" class="mt-12"></div>
   </div>
 
   <script>
+    let selectedFile = null;
+    let fullData = null;
     const uploadArea = document.getElementById('uploadArea');
     const fileInput = document.getElementById('pdf');
+    const extractBtn = document.getElementById('extractBtn');
 
     uploadArea.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => {
+      selectedFile = e.target.files[0];
+      if (selectedFile) {
+        extractBtn.classList.remove('hidden');
+        extractBtn.textContent = `Extract Tables from ${selectedFile.name}`;
+      }
+    });
 
-    fileInput.addEventListener('change', async () => {
-      const file = fileInput.files[0];
-      if (!file) return;
-
+    async function startExtraction() {
+      if (!selectedFile) return;
       uploadArea.classList.add('hidden');
+      extractBtn.classList.add('hidden');
       document.getElementById('loading').classList.remove('hidden');
 
       const formData = new FormData();
-      formData.append('file', file);
+      formData.append('file', selectedFile);
 
       try {
         const res = await fetch('/upload', { method: 'POST', body: formData });
         const data = await res.json();
 
-        let html = `<h2 class="text-4xl font-bold mb-10 text-center">Your ${data.tables.length} Tables</h2>`;
+        if (!data.success || !data.tables) {
+          document.getElementById('results').innerHTML = `
+            <p class="text-red-500 text-center text-2xl">
+              Error: ${data.error || 'Unknown error from server'}
+            </p>`;
+          return;
+        }
+
+        fullData = data;
+        console.log("✅ FULL EXTRACTION DATA:", JSON.stringify(data, null, 2));
+
+        let html = `<h2 class="text-4xl font-bold mb-8 text-center">Your ${data.tables.length} Tables</h2>`;
+        html += `<div class="text-center mb-10">
+          <button onclick="downloadAnalysisJSON()" class="bg-blue-600 hover:bg-blue-700 px-12 py-5 rounded-2xl font-semibold text-xl">📥 Download Full Analysis Data (JSON)</button>
+        </div>`;
 
         data.tables.forEach(table => {
           const blob = new Blob([table.csv], { type: 'text/csv' });
           const url = URL.createObjectURL(blob);
-
           html += `
             <div class="bg-zinc-900 rounded-3xl p-8 mb-10">
-              <div class="flex justify-between mb-6">
+              <div class="flex justify-between items-center mb-6">
                 <p class="text-2xl">Table ${table.table_id} — Page ${table.page_numbers}</p>
                 <a href="${url}" download="table-${table.table_id}.csv" 
                    class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">
                   Download CSV
                 </a>
               </div>
-              <pre class="bg-black p-6 rounded-2xl text-sm overflow-auto max-h-64">${table.csv.substring(0, 800)}...</pre>
             </div>`;
         });
 
+        html += `<div class="text-center mt-12">
+          <a href="/download-all" class="bg-white text-black px-12 py-5 rounded-2xl font-semibold text-2xl">Download All Tables as ZIP</a>
+        </div>`;
+
         document.getElementById('results').innerHTML = html;
       } catch (e) {
-        document.getElementById('results').innerHTML = `<p class="text-red-500 text-center text-2xl">Error: ${e.message}</p>`;
+        document.getElementById('results').innerHTML = `
+          <p class="text-red-500 text-center text-2xl">Error: ${e.message}</p>`;
       } finally {
         document.getElementById('loading').classList.add('hidden');
       }
-    });
+    }
+
+    function downloadAnalysisJSON() {
+      if (!fullData) return;
+      const blob = new Blob([JSON.stringify(fullData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'full_analysis_data.json';
+      a.click();
+    }
   </script>
 </body>
 </html>
