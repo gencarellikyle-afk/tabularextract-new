@@ -102,12 +102,11 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
         return df
 
     def ocr_on_crop(self, pdf_path: str, page_num: int, bbox: tuple) -> pd.DataFrame:
-        """Radical targeted OCR: crop exact camelot bounding box and OCR only that region."""
+        """Radical targeted OCR: crop exact camelot bounding box and OCR only that region for perfect headers."""
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 page = pdf.pages[page_num - 1]
-                # Crop to bbox (camelot bbox is (x0, y0, x1, y1))
-                im = page.to_image(resolution=400).original.crop(bbox)
+                im = page.to_image(resolution=400).original.crop((int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])))
                 text = pytesseract.image_to_string(im, config='--psm 6')
                 lines = [line.strip() for line in text.split('\n') if line.strip()]
                 if not lines:
@@ -184,15 +183,13 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                 raw_csv = df.to_csv(index=False)
                 page_text = self._get_full_page_context(tmp_path, [page_num])
 
-                # Hybrid radical architecture: camelot for boundary detection only
+                # Hybrid architecture: camelot for boundary detection only
                 # If table has bad headers, crop the exact bbox and OCR only that region
                 bad_header_ratio = sum(1 for c in df.columns if any(p in str(c).lower() for p in ['column_', 'th', 'td', '.1', '.2', ''])) / max(1, len(df.columns))
                 if bad_header_ratio > 0.2 or len(df) < 4 or page_num == 1:
-                    # Use camelot bbox for precise crop (camelot tables have .bounding_box)
-                    bbox = getattr(t, 'bounding_box', None)
+                    bbox = getattr(t, 'bbox', None)
                     if bbox:
-                        # bbox is (x0, y0, x1, y1) in points — convert to pixels
-                        ocr_df = self.ocr_on_crop(tmp_path, page_num, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])))
+                        ocr_df = self.ocr_on_crop(tmp_path, page_num, bbox)
                         if not ocr_df.empty:
                             df = ocr_df
                             print(f"DEBUG: Targeted OCR crop activated for table {idx+1} on page {page_num}")
