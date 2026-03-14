@@ -54,10 +54,10 @@
         const res = await fetch('/upload', { method: 'POST', body: formData });
         const data = await res.json();
 
-        if (!data.success || !data.tables) {
+        if (!data.success) {
           document.getElementById('results').innerHTML = `
             <p class="text-red-500 text-center text-2xl">
-              Error: ${data.error || 'Unknown error from server'}
+              Backend Error: ${data.error || JSON.stringify(data)}
             </p>`;
           return;
         }
@@ -92,7 +92,7 @@
         document.getElementById('results').innerHTML = html;
       } catch (e) {
         document.getElementById('results').innerHTML = `
-          <p class="text-red-500 text-center text-2xl">Error: ${e.message}</p>`;
+          <p class="text-red-500 text-center text-2xl">Frontend Error: ${e.message}</p>`;
       } finally {
         document.getElementById('loading').classList.add('hidden');
       }
