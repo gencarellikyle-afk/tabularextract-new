@@ -102,7 +102,6 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
         return df
 
     def ocr_primary_extraction(self, pdf_path: str, page_num: int) -> pd.DataFrame:
-        """Radical primary extraction: OCR as default for all tables with robust parsing."""
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 page = pdf.pages[page_num - 1]
@@ -134,6 +133,16 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
             pass
         return "\n\n".join(context).strip()
 
+    def _needs_rescue(self, df: pd.DataFrame, confidence: float) -> bool:
+        if confidence < 0.92 or df.empty or len(df.columns) == 0:
+            return True
+        cols = [str(c).strip().lower() for c in df.columns]
+        if any(c.startswith('column_') or '(th)' in c or '(td)' in c or c in ['', 'unnamed', '.1', '.2'] for c in cols):
+            return True
+        if len(cols) > 0 and (cols[0].replace(',', '').replace('.', '').isdigit() or any(x.isdigit() for x in cols[0].split())):
+            return True
+        return False
+
     def extract_tables(self, pdf_bytes: bytes) -> Dict[str, Any]:
         tables_list = []
         tmp_path = None
@@ -146,10 +155,8 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                 for page_idx in range(len(pdf.pages)):
                     page_num = page_idx + 1
                     
-                    # Radical new architecture: OCR as PRIMARY extraction for EVERY table
                     df = self.ocr_primary_extraction(tmp_path, page_num)
                     if df.empty:
-                        # Only fall back to camelot if OCR completely fails
                         try:
                             tables_raw = camelot.read_pdf(tmp_path, flavor="lattice", line_scale=45, pages=str(page_num))
                             if tables_raw:
@@ -162,7 +169,6 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                     raw_csv = df.to_csv(index=False)
                     page_text = self._get_full_page_context(tmp_path, [page_num])
 
-                    # Stage 1
                     resp = self.client.messages.create(
                         model="claude-sonnet-4-6",
                         max_tokens=4000,
@@ -187,7 +193,6 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
 
                     confidence = cleaned.get("confidence", 0.85)
 
-                    # Stage 2 Rescue (only if still bad)
                     if self._needs_rescue(df_clean, confidence):
                         rescue_input = f"Full page text:\n{page_text}\n\nRaw table:\n{raw_csv}"
                         rescue_resp = self.client.messages.create(
@@ -209,7 +214,6 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                         df_clean = self.handle_merged_cells(df_clean)
                         df_clean = self.local_header_repair(df_clean, page_text)
 
-                    # Final guardrail
                     df_clean = self.final_polish(df_clean)
                     df_clean = self.local_header_repair(df_clean, page_text)
 
