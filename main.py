@@ -77,19 +77,26 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
         return csv_str
 
     def local_header_repair(self, df: pd.DataFrame, page_text: str) -> pd.DataFrame:
-        """Conservative deterministic repair — only fixes truly bad headers, never duplicates or invents."""
+        """Precise deterministic repair — only fixes truly bad headers using first real printed line from page."""
         if df.empty or not page_text:
             return df
         cols = [str(c).strip() for c in df.columns]
-        bad_patterns = ['column_', 'th', 'td', '.1', '.2', '']
-        page_lines = page_text.split('\n')
+        bad = ['column_', '(th)', '(td)', '.1', '.2', '']
+        page_lines = [line.strip() for line in page_text.split('\n') if len(line.strip()) > 3]
         for i, col in enumerate(cols):
-            if any(p in col.lower() for p in bad_patterns):
-                for line in page_lines:
-                    match = re.search(r'([A-Za-z][A-Za-z0-9\s£$%()/\-]+)', line)
-                    if match and len(match.group(1).strip()) > 3 and not any(p in match.group(1).lower() for p in bad_patterns):
+            if any(p in col.lower() for p in bad):
+                for line in page_lines[:10]:  # first 10 lines = most likely header area
+                    match = re.search(r'^([A-Za-z][A-Za-z0-9\s£$%()/\-]+)', line)
+                    if match and len(match.group(1).strip()) > 3 and not any(p in match.group(1).lower() for p in bad):
                         cols[i] = match.group(1).strip()
                         break
+        # Anti-duplication: if two identical headers appear, keep only the first
+        seen = {}
+        for i, col in enumerate(cols):
+            if col in seen:
+                cols[i] = f"{col} {i+1}"
+            else:
+                seen[col] = True
         df.columns = cols
         return df
 
@@ -200,7 +207,7 @@ NEVER use Column_0, Column_, TH, TD, .1, .2 or any placeholder. Output ONLY this
                     df_clean = self.handle_merged_cells(df_clean)
                     df_clean = self.local_header_repair(df_clean, page_text)
 
-                # Final deterministic guardrail
+                # Final guardrail
                 df_clean = self.final_polish(df_clean)
                 df_clean = self.local_header_repair(df_clean, page_text)
 
