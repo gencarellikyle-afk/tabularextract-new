@@ -1,5 +1,4 @@
-# v10.1: Clean single-file FastAPI PDF table extractor
-# Architecture: lattice→stream→pdfplumber→OCR per-page, quality-gated, AI header repair only on failure
+# v10.2: Fixed 'DataFrame' has no attribute 'str' by safe string conversion
 
 import os, io, re, json, zipfile, tempfile, logging
 from pathlib import Path
@@ -64,8 +63,12 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize whitespace, drop all-empty rows/cols."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
+    
+    # Safe cleaning - convert to string first, handle non-string columns
     for col in df.columns:
-        df[col] = df[col].astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
+        df[col] = df[col].astype(str).replace(['nan', 'None', 'nan'], '')
+        df[col] = df[col].str.strip().str.replace(r"\s+", " ", regex=True).fillna('')
+    
     df.replace("nan", "", inplace=True)
     df = df.loc[~(df == "").all(axis=1)]
     df = df.loc[:, ~(df == "").all(axis=0)]
@@ -213,10 +216,10 @@ def _best_tables_for_page(pdf_path: str, page_num: int) -> list[tuple[pd.DataFra
     page_str = str(page_num)
 
     for strategy_name, strategy_fn in [
-        ("lattice",   lambda: _camelot_lattice(pdf_path, page_str)),
-        ("stream",    lambda: _camelot_stream(pdf_path, page_str)),
-        ("pdfplumber",lambda: _pdfplumber_extract(pdf_path, page_num)),
-        ("ocr",       lambda: _ocr_page(pdf_path, page_num)),
+        ("lattice", lambda: _camelot_lattice(pdf_path, page_str)),
+        ("stream", lambda: _camelot_stream(pdf_path, page_str)),
+        ("pdfplumber", lambda: _pdfplumber_extract(pdf_path, page_num)),
+        ("ocr", lambda: _ocr_page(pdf_path, page_num)),
     ]:
         raw_dfs = strategy_fn()
         if not raw_dfs:
@@ -276,9 +279,9 @@ def extract_tables(pdf_path: str) -> list[dict]:
     # Merge cross-page continuations
     merged: list[tuple[pd.DataFrame, list[int], float]] = []
     for df, page, q in all_tables:
-        if (merged
-                and _tables_are_continuation(merged[-1][0], df)
-                and page == merged[-1][1][-1] + 1):
+        if (merged and
+                _tables_are_continuation(merged[-1][0], df) and
+                page == merged[-1][1][-1] + 1):
             prev_df, pages, prev_q = merged[-1]
             if _header_quality(list(df.columns)) > _header_quality(list(prev_df.columns)):
                 prev_df.columns = df.columns
