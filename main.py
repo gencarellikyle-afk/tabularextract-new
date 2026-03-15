@@ -1,4 +1,4 @@
-# v10.3: Fixed _clean_df to handle duplicate column names before .str operations
+# v10.4: Fix numeric column indices, Col_cont_0, None headers, filter legend tables
 
 import os, io, re, json, zipfile, tempfile, logging
 from pathlib import Path
@@ -14,7 +14,6 @@ log = logging.getLogger("tabularextract")
 
 app = FastAPI(title="tabularextract")
 
-# ── Static files ────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return Path("index.html").read_text()
@@ -25,11 +24,18 @@ async def privacy():
 
 # ── Constants ───────────────────────────────────────────────────────────────────
 PLACEHOLDER_RE = re.compile(
-    r"^\s*(col(umn)?[_\s]*\d+|th\b|header|column\s+header.*|<th>|unnamed[_:\s]*\d*|field\s*\d*)\s*$",
+    r"^\s*(col(umn)?[_\s]*\d+|th\b|header|column\s+header.*|<th>|unnamed[_:\s]*\d*|field\s*\d*|col_cont_\d+|none)\s*$",
     re.IGNORECASE,
 )
+# Single digit or integer-index columns camelot emits as 0,1,2,3...
+INDEX_COL_RE = re.compile(r"^\d+$")
 NUMBER_RE = re.compile(r"^-?[\$£€]?[\d,]+\.?\d*%?$")
 EMPTY_RE = re.compile(r"^\s*$")
+# Content that identifies a "legend/metadata" table rather than real data
+LEGEND_CONTENT_RE = re.compile(
+    r"column header \(th\)|row header \(th\)|data cell \(td\)|\(th\)|\(td\)",
+    re.IGNORECASE,
+)
 AI_CLIENT = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # ── Header quality scoring ───────────────────────────────────────────────────────
@@ -43,6 +49,8 @@ def _header_quality(row: list[str]) -> float:
             scores.append(0.0)
         elif PLACEHOLDER_RE.match(c):
             scores.append(0.0)
+        elif INDEX_COL_RE.match(c):   # treat raw integer indices as placeholders
+            scores.append(0.0)
         elif NUMBER_RE.match(c):
             scores.append(0.3)
         else:
@@ -55,13 +63,13 @@ def _is_data_row(row: list[str]) -> bool:
     numeric = sum(1 for c in row if NUMBER_RE.match(str(c).strip()) or EMPTY_RE.match(str(c).strip()))
     return numeric / len(row) >= 0.6
 
+def _is_legend_table(df: pd.DataFrame) -> bool:
+    """True if table is an accessibility legend (TH/TD labels), not real data."""
+    sample = " ".join(str(v) for v in df.values.flatten()[:20])
+    return bool(LEGEND_CONTENT_RE.search(sample))
+
 # ── DataFrame cleaning ───────────────────────────────────────────────────────────
 def _dedup_columns_inplace(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Rename duplicate column names BEFORE any column-based operations.
-    This prevents df[col] returning a DataFrame instead of a Series.
-    e.g. ['A', 'B', 'A'] → ['A', 'B', 'A_dup1']
-    """
     seen: dict[str, int] = {}
     new_cols = []
     for c in df.columns:
@@ -76,37 +84,76 @@ def _dedup_columns_inplace(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize whitespace, drop all-empty rows/cols. Safe against duplicate columns."""
     df = df.copy()
-    # Step 1: deduplicate columns FIRST — must happen before any df[col] access
     df = _dedup_columns_inplace(df)
-    # Step 2: clean each column safely, now guaranteed to be a Series
     for col in df.columns:
         series = df[col].astype(str)
         series = series.replace({'nan': '', 'None': '', 'NaN': ''})
         series = series.str.strip().str.replace(r"\s+", " ", regex=True).fillna('')
         df[col] = series
-    # Step 3: drop all-empty rows and columns
     df = df.loc[~(df == "").all(axis=1)]
     df = df.loc[:, ~(df == "").all(axis=0)]
     return df
 
 def _promote_first_row_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    """Promote first data row to header if current headers are placeholders/indices."""
     if df.empty:
         return df
     hq = _header_quality(list(df.columns))
     if hq >= 0.5:
         return df
-    candidate = list(df.iloc[0])
+    # Try row 0
+    candidate = [str(c).strip() for c in df.iloc[0]]
     cq = _header_quality(candidate)
     if cq > hq and not _is_data_row(candidate):
-        df.columns = [str(c).strip() if str(c).strip() else f"Col_{i+1}"
-                      for i, c in enumerate(candidate)]
+        df.columns = [c if c else f"Col_{i+1}" for i, c in enumerate(candidate)]
         df = df.iloc[1:].reset_index(drop=True)
     return df
 
+def _fix_none_and_cont_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace Col_cont_N and None headers with content-derived names.
+    Strategy: look at first non-empty value in that column for a text hint,
+    otherwise use positional name.
+    """
+    new_cols = list(df.columns)
+    for i, col in enumerate(new_cols):
+        col_str = str(col).strip()
+        if PLACEHOLDER_RE.match(col_str) or col_str == '' or INDEX_COL_RE.match(col_str):
+            # Try to derive from first non-empty cell in this column
+            col_values = df.iloc[:, i].astype(str).str.strip()
+            non_empty = [v for v in col_values if v and v not in ('nan', 'None', '')]
+            if non_empty:
+                first_val = non_empty[0]
+                # Only use as header if it looks like a label (not a number/year)
+                if not NUMBER_RE.match(first_val) and len(first_val) < 60:
+                    new_cols[i] = first_val
+                    # Remove that value from the data since it's now the header
+                    first_idx = df.index[df.iloc[:, i].astype(str).str.strip() == first_val][0]
+                    df.at[first_idx, col] = ''
+                else:
+                    new_cols[i] = f"Col_{i+1}"
+            else:
+                new_cols[i] = f"Col_{i+1}"
+    df.columns = new_cols
+    return df
+
+def _handle_merged_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """Forward-fill empty header cells (merged-cell tables)."""
+    cols = list(df.columns)
+    filled = []
+    last = "Col"
+    for i, c in enumerate(cols):
+        c_str = str(c).strip()
+        if EMPTY_RE.match(c_str) or PLACEHOLDER_RE.match(c_str) or INDEX_COL_RE.match(c_str):
+            filled.append(f"{last}_cont_{i}")
+        else:
+            last = c_str
+            filled.append(c_str)
+    df.columns = filled
+    return df
+
 def _deduplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Final dedup pass with _1, _2 suffix style for output."""
     seen: dict[str, int] = {}
     new_cols = []
     for c in df.columns:
@@ -117,19 +164,6 @@ def _deduplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
             seen[c] = 0
             new_cols.append(c)
     df.columns = new_cols
-    return df
-
-def _handle_merged_headers(df: pd.DataFrame) -> pd.DataFrame:
-    cols = list(df.columns)
-    filled = []
-    last = "Col"
-    for i, c in enumerate(cols):
-        if EMPTY_RE.match(str(c)) or PLACEHOLDER_RE.match(str(c)):
-            filled.append(f"{last}_cont_{i}")
-        else:
-            last = c
-            filled.append(c)
-    df.columns = filled
     return df
 
 # ── AI header repair ─────────────────────────────────────────────────────────────
@@ -233,10 +267,15 @@ def _best_tables_for_page(pdf_path: str, page_num: int) -> list[tuple[pd.DataFra
             continue
         processed = []
         for df in raw_dfs:
-            df = _clean_df(df)              # dedup happens here first
+            df = _clean_df(df)
             if df.empty or df.shape[0] < 1:
                 continue
+            if _is_legend_table(df):
+                log.info(f"  Page {page_num}: skipping legend/metadata table")
+                continue
             df = _promote_first_row_if_needed(df)
+            df = _clean_df(df)
+            df = _fix_none_and_cont_headers(df)
             df = _handle_merged_headers(df)
             df = _deduplicate_columns(df)
             df = _clean_df(df)
