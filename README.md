@@ -1,48 +1,12 @@
-\# TabularExtract
+# TabularExtract
 
+Universal PDF table extractor. Extracts clean, Excel-ready tables from any PDF.
 
+## Local Setup
 
-The simplest and most accurate way to extract tables from any PDF.
+```bash
+cp .env.example .env
+# Fill in ANTHROPIC_API_KEY and STRIPE_SECRET_KEY in .env
 
-
-
-\### What you'll get
-
-\- Perfectly clean tables every single time — even from messy invoices, reports, research papers, and scanned documents  
-
-\- Ready for Excel or Google Sheets with no cleanup needed  
-
-\- Automatically handles repeating headers, merged cells, symbols, footnotes, and complex layouts  
-
-\- Lightning fast and easy to use  
-
-\- Zero data storage — your files are processed and deleted immediately  
-
-
-
-\### How it works
-
-1\. Upload any PDF  
-
-2\. Get perfect tables back instantly  
-
-3\. Download as CSV (ready to use)
-
-
-
-\### Pricing \& Plans
-
-\- \*\*Pro\*\* — $29/month (5,000 pages)  
-
-\- \*\*Business\*\* — $99/month (25,000 pages)  
-
-\- Overages available if you need more  
-
-
-
-Built for businesses and professionals who need reliable table extraction without the hassle.
-
-
-
-Live at tabularextract.com
-
+docker build -t tabularextract .
+docker run -p 8000:8000 --env-file .env tabularextract
