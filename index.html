@@ -24,14 +24,12 @@
     </div>
     <div id="results" class="mt-12"></div>
   </div>
-
   <script>
     let selectedFile = null;
     let fullData = null;
     const uploadArea = document.getElementById('uploadArea');
     const fileInput = document.getElementById('pdf');
     const extractBtn = document.getElementById('extractBtn');
-
     uploadArea.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', (e) => {
       selectedFile = e.target.files[0];
@@ -40,20 +38,16 @@
         extractBtn.textContent = `Extract Tables from ${selectedFile.name}`;
       }
     });
-
     async function startExtraction() {
       if (!selectedFile) return;
       uploadArea.classList.add('hidden');
       extractBtn.classList.add('hidden');
       document.getElementById('loading').classList.remove('hidden');
-
       const formData = new FormData();
       formData.append('file', selectedFile);
-
       try {
         const res = await fetch('/extract', { method: 'POST', body: formData });
         const data = await res.json();
-
         if (!data.success) {
           document.getElementById('results').innerHTML = `
             <p class="text-red-500 text-center text-2xl">
@@ -61,15 +55,12 @@
             </p>`;
           return;
         }
-
         fullData = data;
         console.log("✅ FULL EXTRACTION DATA:", JSON.stringify(data, null, 2));
-
         let html = `<h2 class="text-4xl font-bold mb-8 text-center">Your ${data.tables.length} Tables</h2>`;
         html += `<div class="text-center mb-10">
           <button onclick="downloadAnalysisJSON()" class="bg-blue-600 hover:bg-blue-700 px-12 py-5 rounded-2xl font-semibold text-xl">📥 Download Full Analysis Data (JSON)</button>
         </div>`;
-
         data.tables.forEach(table => {
           const blob = new Blob([table.csv], { type: 'text/csv' });
           const url = URL.createObjectURL(blob);
@@ -77,18 +68,16 @@
             <div class="bg-zinc-900 rounded-3xl p-8 mb-10">
               <div class="flex justify-between items-center mb-6">
                 <p class="text-2xl">Table ${table.table_id} — Page ${table.page_numbers}</p>
-                <a href="${url}" download="table-${table.table_id}.csv" 
+                <a href="${url}" download="table-${table.table_id}.csv"
                    class="bg-emerald-600 hover:bg-emerald-700 px-10 py-4 rounded-2xl font-semibold text-lg">
                   Download CSV
                 </a>
               </div>
             </div>`;
         });
-
         html += `<div class="text-center mt-12">
-          <a href="/download-all" class="bg-white text-black px-12 py-5 rounded-2xl font-semibold text-2xl">Download All Tables as ZIP</a>
+          <button onclick="downloadAllZip()" class="bg-white text-black px-12 py-5 rounded-2xl font-semibold text-2xl">Download All Tables as ZIP</button>
         </div>`;
-
         document.getElementById('results').innerHTML = html;
       } catch (e) {
         document.getElementById('results').innerHTML = `
@@ -97,7 +86,6 @@
         document.getElementById('loading').classList.add('hidden');
       }
     }
-
     function downloadAnalysisJSON() {
       if (!fullData) return;
       const blob = new Blob([JSON.stringify(fullData, null, 2)], { type: 'application/json' });
@@ -105,6 +93,21 @@
       const a = document.createElement('a');
       a.href = url;
       a.download = 'full_analysis_data.json';
+      a.click();
+    }
+
+    async function downloadAllZip() {
+      if (!fullData) return;
+      const res = await fetch('/download-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tables: fullData.tables })
+      });
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'tables.zip';
       a.click();
     }
   </script>
