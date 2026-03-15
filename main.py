@@ -1,16 +1,14 @@
-# v10.0: Radical restart — validated multi-pass extraction with strict header recovery
+# v10.1: Clean single-file FastAPI PDF table extractor
 # Architecture: lattice→stream→pdfplumber→OCR per-page, quality-gated, AI header repair only on failure
 
 import os, io, re, json, zipfile, tempfile, logging
 from pathlib import Path
-from typing import Optional
 import pandas as pd
 import pdfplumber
 import camelot
 import anthropic
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tabularextract")
@@ -18,17 +16,13 @@ log = logging.getLogger("tabularextract")
 app = FastAPI(title="tabularextract")
 
 # ── Static files ────────────────────────────────────────────────────────────────
-for _f in ["index.html", "privacy.html"]:
-    if Path(_f).exists():
-        pass
-if Path("index.html").exists():
-    @app.get("/", response_class=HTMLResponse)
-    async def root():
-        return Path("index.html").read_text()
-if Path("privacy.html").exists():
-    @app.get("/privacy", response_class=HTMLResponse)
-    async def privacy():
-        return Path("privacy.html").read_text()
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return Path("index.html").read_text()
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy():
+    return Path("privacy.html").read_text()
 
 # ── Constants ───────────────────────────────────────────────────────────────────
 PLACEHOLDER_RE = re.compile(
@@ -53,7 +47,7 @@ def _header_quality(row: list[str]) -> float:
         elif PLACEHOLDER_RE.match(c):
             scores.append(0.0)
         elif NUMBER_RE.match(c):
-            scores.append(0.3)  # numbers can be valid headers (years etc)
+            scores.append(0.3)
         else:
             scores.append(1.0)
     return sum(scores) / len(scores)
@@ -84,7 +78,6 @@ def _promote_first_row_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     hq = _header_quality(list(df.columns))
     if hq >= 0.5:
         return df
-    # Try first row
     candidate = list(df.iloc[0])
     cq = _header_quality(candidate)
     if cq > hq and not _is_data_row(candidate):
@@ -199,7 +192,6 @@ def _ocr_page(pdf_path: str, page_num: int) -> list[pd.DataFrame]:
             page = pdf.pages[page_num - 1]
             img = page.to_image(resolution=200).original
             text = pytesseract.image_to_string(img, config="--psm 6")
-            # Parse TSV-like structure
             lines = [l for l in text.splitlines() if l.strip()]
             if len(lines) < 2:
                 return []
@@ -216,15 +208,15 @@ def _ocr_page(pdf_path: str, page_num: int) -> list[pd.DataFrame]:
 def _best_tables_for_page(pdf_path: str, page_num: int) -> list[tuple[pd.DataFrame, float]]:
     """
     Returns list of (df, quality_score) for a single page.
-    Tries strategies in order, accepts first batch with avg quality >= 0.6.
+    Tries strategies in order, accepts first batch with avg quality >= 0.45.
     """
     page_str = str(page_num)
 
     for strategy_name, strategy_fn in [
-        ("lattice", lambda: _camelot_lattice(pdf_path, page_str)),
-        ("stream",  lambda: _camelot_stream(pdf_path, page_str)),
-        ("pdfplumber", lambda: _pdfplumber_extract(pdf_path, page_num)),
-        ("ocr",     lambda: _ocr_page(pdf_path, page_num)),
+        ("lattice",   lambda: _camelot_lattice(pdf_path, page_str)),
+        ("stream",    lambda: _camelot_stream(pdf_path, page_str)),
+        ("pdfplumber",lambda: _pdfplumber_extract(pdf_path, page_num)),
+        ("ocr",       lambda: _ocr_page(pdf_path, page_num)),
     ]:
         raw_dfs = strategy_fn()
         if not raw_dfs:
@@ -248,9 +240,7 @@ def _best_tables_for_page(pdf_path: str, page_num: int) -> list[tuple[pd.DataFra
         avg_q = sum(q for _, q in processed) / len(processed)
         log.info(f"  Page {page_num} {strategy_name}: {len(processed)} tables, avg_q={avg_q:.2f}")
 
-        # Accept if quality is decent OR this is pdfplumber/OCR (last resorts)
         if avg_q >= 0.45 or strategy_name in ("pdfplumber", "ocr"):
-            # Run AI repair on any table still below threshold
             final = []
             for df, q in processed:
                 if q < 0.4:
@@ -261,14 +251,13 @@ def _best_tables_for_page(pdf_path: str, page_num: int) -> list[tuple[pd.DataFra
 
     return []
 
-# ── Dedup across pages (same table continuing) ──────────────────────────────────
+# ── Cross-page continuation detection ───────────────────────────────────────────
 def _tables_are_continuation(df_a: pd.DataFrame, df_b: pd.DataFrame) -> bool:
     """True if df_b looks like a continuation of df_a (same columns, df_b has no real header)."""
     if list(df_a.columns) == list(df_b.columns):
         return True
     if df_b.shape[1] == df_a.shape[1]:
-        hq = _header_quality(list(df_b.columns))
-        if hq < 0.3:
+        if _header_quality(list(df_b.columns)) < 0.3:
             return True
     return False
 
@@ -278,24 +267,23 @@ def extract_tables(pdf_path: str) -> list[dict]:
         n_pages = len(pdf.pages)
 
     log.info(f"Extracting from {n_pages}-page PDF")
-    all_tables: list[tuple[pd.DataFrame, int, float]] = []  # (df, page, quality)
+    all_tables: list[tuple[pd.DataFrame, int, float]] = []
 
     for page_num in range(1, n_pages + 1):
-        page_tables = _best_tables_for_page(pdf_path, page_num)
-        for df, q in page_tables:
+        for df, q in _best_tables_for_page(pdf_path, page_num):
             all_tables.append((df, page_num, q))
 
     # Merge cross-page continuations
     merged: list[tuple[pd.DataFrame, list[int], float]] = []
     for df, page, q in all_tables:
-        if (merged and
-                _tables_are_continuation(merged[-1][0], df) and
-                page == merged[-1][1][-1] + 1):
+        if (merged
+                and _tables_are_continuation(merged[-1][0], df)
+                and page == merged[-1][1][-1] + 1):
             prev_df, pages, prev_q = merged[-1]
-            prev_df.columns = df.columns if _header_quality(list(df.columns)) > _header_quality(list(prev_df.columns)) else prev_df.columns
+            if _header_quality(list(df.columns)) > _header_quality(list(prev_df.columns)):
+                prev_df.columns = df.columns
             combined = pd.concat([prev_df, df], ignore_index=True)
-            combined = _clean_df(combined)
-            merged[-1] = (combined, pages + [page], max(q, prev_q))
+            merged[-1] = (_clean_df(combined), pages + [page], max(q, prev_q))
         else:
             merged.append((df, [page], q))
 
@@ -305,14 +293,13 @@ def extract_tables(pdf_path: str) -> list[dict]:
         df = _deduplicate_columns(_clean_df(df))
         if df.empty or df.shape[0] < 1 or df.shape[1] < 1:
             continue
-        csv_str = df.to_csv(index=False)
         try:
             records = df.to_dict(orient="records")
         except Exception:
             records = []
         results.append({
             "table_id": f"table_{i+1}",
-            "csv": csv_str,
+            "csv": df.to_csv(index=False),
             "json": records,
             "confidence": round(q, 3),
             "page_numbers": pages,
@@ -326,15 +313,12 @@ def extract_tables(pdf_path: str) -> list[dict]:
 async def extract(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are supported.")
-
     contents = await file.read()
     if len(contents) > 50 * 1024 * 1024:
         raise HTTPException(413, "File too large (max 50MB).")
-
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(contents)
         tmp_path = tmp.name
-
     try:
         tables = extract_tables(tmp_path)
     except Exception as e:
@@ -345,7 +329,6 @@ async def extract(file: UploadFile = File(...)):
             os.unlink(tmp_path)
         except Exception:
             pass
-
     return {"success": True, "tables": tables}
 
 @app.post("/download-all")
@@ -354,13 +337,10 @@ async def download_all(request: Request):
     tables = body.get("tables", [])
     if not tables:
         raise HTTPException(400, "No tables provided.")
-
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for t in tables:
-            tid = t.get("table_id", "table")
-            csv_data = t.get("csv", "")
-            zf.writestr(f"{tid}.csv", csv_data)
+            zf.writestr(f"{t.get('table_id', 'table')}.csv", t.get("csv", ""))
         zf.writestr(
             "full_analysis_data.json",
             json.dumps({"tables": tables}, indent=2, ensure_ascii=False),
