@@ -1,4 +1,4 @@
-# v10.2: Fixed 'DataFrame' has no attribute 'str' by safe string conversion
+# v10.3: Fixed _clean_df to handle duplicate column names before .str operations
 
 import os, io, re, json, zipfile, tempfile, logging
 from pathlib import Path
@@ -7,7 +7,7 @@ import pdfplumber
 import camelot
 import anthropic
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tabularextract")
@@ -28,14 +28,12 @@ PLACEHOLDER_RE = re.compile(
     r"^\s*(col(umn)?[_\s]*\d+|th\b|header|column\s+header.*|<th>|unnamed[_:\s]*\d*|field\s*\d*)\s*$",
     re.IGNORECASE,
 )
-YEAR_RE = re.compile(r"^(19|20)\d{2}$")
 NUMBER_RE = re.compile(r"^-?[\$£€]?[\d,]+\.?\d*%?$")
 EMPTY_RE = re.compile(r"^\s*$")
 AI_CLIENT = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # ── Header quality scoring ───────────────────────────────────────────────────────
 def _header_quality(row: list[str]) -> float:
-    """0.0 = all placeholders/empty, 1.0 = all real text headers."""
     if not row:
         return 0.0
     scores = []
@@ -52,30 +50,48 @@ def _header_quality(row: list[str]) -> float:
     return sum(scores) / len(scores)
 
 def _is_data_row(row: list[str]) -> bool:
-    """True if row looks like data (mostly numbers/money) not a header."""
     if not row:
         return False
     numeric = sum(1 for c in row if NUMBER_RE.match(str(c).strip()) or EMPTY_RE.match(str(c).strip()))
     return numeric / len(row) >= 0.6
 
 # ── DataFrame cleaning ───────────────────────────────────────────────────────────
+def _dedup_columns_inplace(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename duplicate column names BEFORE any column-based operations.
+    This prevents df[col] returning a DataFrame instead of a Series.
+    e.g. ['A', 'B', 'A'] → ['A', 'B', 'A_dup1']
+    """
+    seen: dict[str, int] = {}
+    new_cols = []
+    for c in df.columns:
+        key = str(c).strip()
+        if key in seen:
+            seen[key] += 1
+            new_cols.append(f"{key}_dup{seen[key]}")
+        else:
+            seen[key] = 0
+            new_cols.append(key)
+    df.columns = new_cols
+    return df
+
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize whitespace, drop all-empty rows/cols."""
+    """Normalize whitespace, drop all-empty rows/cols. Safe against duplicate columns."""
     df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    
-    # Safe cleaning - convert to string first, handle non-string columns
+    # Step 1: deduplicate columns FIRST — must happen before any df[col] access
+    df = _dedup_columns_inplace(df)
+    # Step 2: clean each column safely, now guaranteed to be a Series
     for col in df.columns:
-        df[col] = df[col].astype(str).replace(['nan', 'None', 'nan'], '')
-        df[col] = df[col].str.strip().str.replace(r"\s+", " ", regex=True).fillna('')
-    
-    df.replace("nan", "", inplace=True)
+        series = df[col].astype(str)
+        series = series.replace({'nan': '', 'None': '', 'NaN': ''})
+        series = series.str.strip().str.replace(r"\s+", " ", regex=True).fillna('')
+        df[col] = series
+    # Step 3: drop all-empty rows and columns
     df = df.loc[~(df == "").all(axis=1)]
     df = df.loc[:, ~(df == "").all(axis=0)]
     return df
 
 def _promote_first_row_if_needed(df: pd.DataFrame) -> pd.DataFrame:
-    """If current headers are placeholder/generic, try promoting first data row."""
     if df.empty:
         return df
     hq = _header_quality(list(df.columns))
@@ -90,7 +106,7 @@ def _promote_first_row_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _deduplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Make column names unique."""
+    """Final dedup pass with _1, _2 suffix style for output."""
     seen: dict[str, int] = {}
     new_cols = []
     for c in df.columns:
@@ -104,7 +120,6 @@ def _deduplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _handle_merged_headers(df: pd.DataFrame) -> pd.DataFrame:
-    """Forward-fill empty header cells (common in merged-cell tables)."""
     cols = list(df.columns)
     filled = []
     last = "Col"
@@ -117,9 +132,8 @@ def _handle_merged_headers(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = filled
     return df
 
-# ── AI header repair (only called when quality < 0.4) ───────────────────────────
+# ── AI header repair ─────────────────────────────────────────────────────────────
 def _ai_repair_headers(df: pd.DataFrame, context: str = "") -> pd.DataFrame:
-    """Ask Claude to infer real headers from first few rows. Strict JSON response."""
     try:
         preview_rows = df.head(5).values.tolist()
         current_headers = list(df.columns)
@@ -185,10 +199,8 @@ def _pdfplumber_extract(pdf_path: str, page_num: int) -> list[pd.DataFrame]:
         return []
 
 def _ocr_page(pdf_path: str, page_num: int) -> list[pd.DataFrame]:
-    """Last resort: render page to image and OCR for tables."""
     try:
         import pytesseract
-        from PIL import Image
         with pdfplumber.open(pdf_path) as pdf:
             if page_num - 1 >= len(pdf.pages):
                 return []
@@ -209,25 +221,19 @@ def _ocr_page(pdf_path: str, page_num: int) -> list[pd.DataFrame]:
 
 # ── Quality-gated multi-pass per page ───────────────────────────────────────────
 def _best_tables_for_page(pdf_path: str, page_num: int) -> list[tuple[pd.DataFrame, float]]:
-    """
-    Returns list of (df, quality_score) for a single page.
-    Tries strategies in order, accepts first batch with avg quality >= 0.45.
-    """
     page_str = str(page_num)
-
     for strategy_name, strategy_fn in [
-        ("lattice", lambda: _camelot_lattice(pdf_path, page_str)),
-        ("stream", lambda: _camelot_stream(pdf_path, page_str)),
+        ("lattice",    lambda: _camelot_lattice(pdf_path, page_str)),
+        ("stream",     lambda: _camelot_stream(pdf_path, page_str)),
         ("pdfplumber", lambda: _pdfplumber_extract(pdf_path, page_num)),
-        ("ocr", lambda: _ocr_page(pdf_path, page_num)),
+        ("ocr",        lambda: _ocr_page(pdf_path, page_num)),
     ]:
         raw_dfs = strategy_fn()
         if not raw_dfs:
             continue
-
         processed = []
         for df in raw_dfs:
-            df = _clean_df(df)
+            df = _clean_df(df)              # dedup happens here first
             if df.empty or df.shape[0] < 1:
                 continue
             df = _promote_first_row_if_needed(df)
@@ -236,13 +242,10 @@ def _best_tables_for_page(pdf_path: str, page_num: int) -> list[tuple[pd.DataFra
             df = _clean_df(df)
             hq = _header_quality(list(df.columns))
             processed.append((df, hq))
-
         if not processed:
             continue
-
         avg_q = sum(q for _, q in processed) / len(processed)
         log.info(f"  Page {page_num} {strategy_name}: {len(processed)} tables, avg_q={avg_q:.2f}")
-
         if avg_q >= 0.45 or strategy_name in ("pdfplumber", "ocr"):
             final = []
             for df, q in processed:
@@ -251,12 +254,10 @@ def _best_tables_for_page(pdf_path: str, page_num: int) -> list[tuple[pd.DataFra
                     q = _header_quality(list(df.columns))
                 final.append((df, q))
             return final
-
     return []
 
 # ── Cross-page continuation detection ───────────────────────────────────────────
 def _tables_are_continuation(df_a: pd.DataFrame, df_b: pd.DataFrame) -> bool:
-    """True if df_b looks like a continuation of df_a (same columns, df_b has no real header)."""
     if list(df_a.columns) == list(df_b.columns):
         return True
     if df_b.shape[1] == df_a.shape[1]:
@@ -268,20 +269,17 @@ def _tables_are_continuation(df_a: pd.DataFrame, df_b: pd.DataFrame) -> bool:
 def extract_tables(pdf_path: str) -> list[dict]:
     with pdfplumber.open(pdf_path) as pdf:
         n_pages = len(pdf.pages)
-
     log.info(f"Extracting from {n_pages}-page PDF")
     all_tables: list[tuple[pd.DataFrame, int, float]] = []
-
     for page_num in range(1, n_pages + 1):
         for df, q in _best_tables_for_page(pdf_path, page_num):
             all_tables.append((df, page_num, q))
 
-    # Merge cross-page continuations
     merged: list[tuple[pd.DataFrame, list[int], float]] = []
     for df, page, q in all_tables:
-        if (merged and
-                _tables_are_continuation(merged[-1][0], df) and
-                page == merged[-1][1][-1] + 1):
+        if (merged
+                and _tables_are_continuation(merged[-1][0], df)
+                and page == merged[-1][1][-1] + 1):
             prev_df, pages, prev_q = merged[-1]
             if _header_quality(list(df.columns)) > _header_quality(list(prev_df.columns)):
                 prev_df.columns = df.columns
@@ -290,7 +288,6 @@ def extract_tables(pdf_path: str) -> list[dict]:
         else:
             merged.append((df, [page], q))
 
-    # Build output
     results = []
     for i, (df, pages, q) in enumerate(merged):
         df = _deduplicate_columns(_clean_df(df))
@@ -307,7 +304,6 @@ def extract_tables(pdf_path: str) -> list[dict]:
             "confidence": round(q, 3),
             "page_numbers": pages,
         })
-
     log.info(f"Extracted {len(results)} tables total")
     return results
 
